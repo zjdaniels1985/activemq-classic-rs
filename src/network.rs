@@ -30,7 +30,11 @@ type AdvisoryAck = Box<
         + Sync,
 >;
 
-pub fn start(core: Arc<BrokerCore>, connectors: Vec<NetworkConnectorConfig>) {
+pub fn start(
+    core: Arc<BrokerCore>,
+    connectors: Vec<NetworkConnectorConfig>,
+) -> tokio::task::JoinSet<()> {
+    let mut tasks = tokio::task::JoinSet::new();
     for connector in connectors {
         if connector.duplex {
             tracing::error!(
@@ -70,9 +74,21 @@ pub fn start(core: Arc<BrokerCore>, connectors: Vec<NetworkConnectorConfig>) {
             continue;
         }
         let core = Arc::clone(&core);
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             connector_loop(core, connector).await;
         });
+    }
+    tasks
+}
+
+struct BridgeConnection {
+    core: Arc<BrokerCore>,
+    connection: u64,
+}
+
+impl Drop for BridgeConnection {
+    fn drop(&mut self) {
+        self.core.disconnect(self.connection);
     }
 }
 
@@ -130,6 +146,10 @@ async fn connect_and_run(
     let broker_info = core.info();
     let local_broker_id = broker_info.id;
     let (connection, mut events) = core.connect_internal(&format!("network:{}", config.name));
+    let _connection_guard = BridgeConnection {
+        core: Arc::clone(&core),
+        connection,
+    };
     let mut local_consumers = BTreeMap::<Destination, u64>::new();
     let mut remote_demands = HashMap::<String, Destination>::new();
 

@@ -16,6 +16,7 @@ pub struct RunningBroker {
     pub core: Arc<BrokerCore>,
     pub addresses: Vec<(&'static str, std::net::SocketAddr)>,
     tasks: JoinSet<io::Result<()>>,
+    network_tasks: JoinSet<()>,
 }
 
 impl RunningBroker {
@@ -37,6 +38,7 @@ impl RunningBroker {
 
     pub fn stop(mut self) {
         self.tasks.abort_all();
+        self.network_tasks.abort_all();
         self.core.shutdown();
     }
 }
@@ -102,11 +104,12 @@ pub async fn start(config: AppConfig) -> io::Result<RunningBroker> {
         ));
     }
 
-    crate::network::start(Arc::clone(&core), config.network_connectors.clone());
+    let network_tasks = crate::network::start(Arc::clone(&core), config.network_connectors.clone());
 
     Ok(RunningBroker {
         core,
         addresses,
         tasks,
+        network_tasks,
     })
 }

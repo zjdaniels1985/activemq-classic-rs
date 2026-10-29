@@ -99,6 +99,7 @@ async fn handle_connection(
     };
     stream.write_all(AMQP_HEADER).await?;
     let mut core_conn = None;
+    let mut _connection_guard = None;
     let mut events: Option<tokio::sync::mpsc::UnboundedReceiver<Event>> = None;
     let mut links = HashMap::<(u16, u32), Link>::new();
     let mut link_aliases = HashMap::<(u16, u32), (u16, u32)>::new();
@@ -142,10 +143,14 @@ async fn handle_connection(
                             }
                         };
                         core_conn = Some(connection);
+                        _connection_guard = Some(ConnectionGuard {
+                            core: Arc::clone(&context.core),
+                            connection,
+                        });
                         events = Some(rx);
                         let response = described(0x10, list(vec![
                             string(format!("{}-broker", container)), null(),
-                            uint(context.max_frame_size.min(u32::MAX as usize) as u32), uint(u16::MAX as u32), uint(60_000),
+                            uint(context.max_frame_size.min(u32::MAX as usize) as u32), Value::U16(u16::MAX), uint(60_000),
                             null(), null(), array_symbols(&["ANONYMOUS-RELAY", "DELAYED_DELIVERY"]), null(),
                             map(vec![(symbol("product"), string("ActiveMQ Classic")), (symbol("version"), string("6.2.0")), (symbol("topic-prefix"), string("topic://")), (symbol("queue-prefix"), string("queue://"))]),
                         ]));
@@ -157,7 +162,7 @@ async fn handle_connection(
                             remote_channels.insert(frame.channel, remote_channel);
                             continue;
                         }
-                        let response = described(0x11, list(vec![uint(frame.channel as u32), uint(0), uint(0x7fffffff), uint(0x7fffffff), uint(0x7fffffff)]));
+                        let response = described(0x11, list(vec![Value::U16(frame.channel), uint(0), uint(0x7fffffff), uint(0x7fffffff), uint(0x7fffffff)]));
                         write_frame(&mut stream, AMQP_FRAME, frame.channel, &encode(&response), peer_frame_max as usize).await?;
                     }
                     Some(0x12) => {
@@ -325,7 +330,7 @@ async fn handle_connection(
                                 }
                                 _ => return Err(invalid_data("unknown transaction coordinator command")),
                             };
-                            let response = described(0x14, list(vec![uint(handle), uint(delivery_id), binary(delivery_id.to_be_bytes().to_vec()), uint(0), boolean(true), boolean(false), uint(0), response_state]));
+                            let response = described(0x15, list(vec![boolean(true), uint(delivery_id), null(), boolean(true), response_state]));
                             write_frame(&mut stream, AMQP_FRAME, channel, &encode(&response), peer_frame_max as usize).await?;
                         } else {
                             let (message, _) = decode_message(&bytes, link.destination.clone())?;
@@ -334,13 +339,13 @@ async fn handle_connection(
                             match context.core.send(conn, message, tx.as_ref()) {
                                 Ok(()) if !settled => {
                                     let state = if let Some(tx) = tx { transactional_state(&tx) } else { described(0x24, list(vec![])) };
-                                    let disp = described(0x15, list(vec![boolean(false), uint(delivery_id), null(), boolean(true), state]));
+                                    let disp = described(0x15, list(vec![boolean(true), uint(delivery_id), null(), boolean(true), state]));
                                     write_frame(&mut stream, AMQP_FRAME, channel, &encode(&disp), peer_frame_max as usize).await?;
                                 }
                                 Ok(()) => {}
                                 Err(error) => {
                                     let rejected = described(0x25, list(vec![described(0x1d, list(vec![symbol(error_condition(&error)), string(error.to_string())]))]));
-                                    let disp = described(0x15, list(vec![boolean(false), uint(delivery_id), null(), boolean(true), rejected]));
+                                    let disp = described(0x15, list(vec![boolean(true), uint(delivery_id), null(), boolean(true), rejected]));
                                     write_frame(&mut stream, AMQP_FRAME, channel, &encode(&disp), peer_frame_max as usize).await?;
                                 }
                             }
@@ -439,10 +444,18 @@ async fn handle_connection(
             }
         }
     }
-    if let Some(connection) = core_conn {
-        context.core.disconnect(connection);
-    }
     Ok(())
+}
+
+struct ConnectionGuard {
+    core: Arc<BrokerCore>,
+    connection: u64,
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.core.disconnect(self.connection);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1113,6 +1126,14 @@ fn descriptor(v: &Value) -> Option<u64> {
             Value::U64(v) => Some(*v),
             Value::U32(v) => Some(*v as u64),
             Value::U8(v) => Some(*v as u64),
+            Value::Symbol(name) => match name.as_str() {
+                "amqp:coordinator:list" => Some(0x30),
+                "amqp:declare:list" => Some(0x31),
+                "amqp:discharge:list" => Some(0x32),
+                "amqp:declared:list" => Some(0x33),
+                "amqp:transactional-state:list" => Some(0x34),
+                _ => None,
+            },
             _ => None,
         }
     } else {

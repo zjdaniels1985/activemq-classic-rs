@@ -18,18 +18,20 @@ is evolving; do not expose this development broker to untrusted networks.
 - Persistent scheduled delivery (`AMQ_SCHEDULED_DELAY`, `PERIOD`, `REPEAT`,
   `CRON`) and scheduler management.
 - Sled persistence and restart recovery; an optional in-memory backend.
-- OpenWire with loose encoding, STOMP 1.0–1.2 and MQTT 3.1/3.1.1 TCP adapters.
+- OpenWire with loose encoding, STOMP 1.0–1.2, MQTT 3.1/3.1.1 and AMQP 1.0
+  TCP adapters.
+- Static and demand-driven OpenWire broker bridges, including destination
+  exclusions, remote authentication, URI failover and broker-path/TTL filtering.
 - An embedded Rust/Axum administrative web console and JSON API.
 - Configurable structured logging with text/JSON output and optional log files.
 
 OpenWire interoperability has been exercised with the ActiveMQ 6.2.6 Java
 client, including topics, transactions, durable subscriptions, selectors,
 temporary destinations, scheduling and XA. STOMP and MQTT interoperability
-harnesses use `stomp.py` and `paho-mqtt`. These checks do not establish complete
-Classic behavioral parity.
-
-AMQP 1.0 and broker networking are being integrated; their current listener and
-configuration scaffolding alone does not establish protocol support.
+harnesses use `stomp.py` and `paho-mqtt`. AMQP checks use Qpid Proton, including
+transactional send commit/rollback and durable subscription reconnect with
+offline delivery. These checks do not establish complete Classic behavioral
+parity.
 
 ## Build and run
 
@@ -50,7 +52,7 @@ defaults. `--help` describes command-line overrides. Default listener addresses:
 | OpenWire | `127.0.0.1:61616` |
 | STOMP | `127.0.0.1:61613` |
 | MQTT | `127.0.0.1:1883` |
-| AMQP (integration in progress) | `127.0.0.1:5672` |
+| AMQP 1.0 | `127.0.0.1:5672` |
 | Web console | `http://127.0.0.1:8161/` |
 
 Set `enabled = false` for any unused protocol or console. Sled defaults to
@@ -108,6 +110,11 @@ appropriate TLS termination.
 - Repeated MQTT SUBSCRIBE does not replay retained messages again. MQTT's
   optional packet journal and core store are not an atomic persistence domain;
   a crash at that boundary can duplicate QoS 2 routing.
+- Network connectors require separate reverse connectors instead of duplex.
+  Non-conduit subscriptions, temporary-destination forwarding and advisory
+  payload forwarding are unsupported. Established-connection restart recovery
+  has not been independently verified. Forwarding is not an atomic distributed
+  transaction; loss of a remote response can cause duplicates on retry.
 - TLS/WebSocket transports, discovery/multicast, JMX, XPath selectors,
   retroactive consumers and MQTT 5 are unsupported.
 - Complete Classic plugin, management, storage, clustering and failure-mode

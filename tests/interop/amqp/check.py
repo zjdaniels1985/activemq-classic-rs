@@ -7,7 +7,8 @@ import time
 
 from proton import Delivery, Message, ModifiedDisposition, symbol
 from proton.handlers import MessagingHandler
-from proton.reactor import Container, Selector
+from proton.reactor import Container, DurableSubscription, Selector
+from proton.utils import BlockingConnection
 
 URL = os.environ.get("AMQP_URL", "amqp://127.0.0.1:65042")
 TIMEOUT = 6
@@ -178,7 +179,139 @@ def run_roundtrip(name, address, messages, expected, **kwargs):
     print(f"PASS {name}", flush=True)
 
 
+class TransactionProbe(MessagingHandler):
+    def __init__(self):
+        super().__init__(auto_accept=False)
+        self.transaction = None
+        self.sender = None
+        self.delivery = None
+        self.phase = "abort"
+        self.committed = False
+        self.received = False
+        self.failure = None
+
+    def on_start(self, event):
+        self.connection = event.container.connect(URL, reconnect=False)
+        self.sender = event.container.create_sender(
+            self.connection, "queue://proton-transactions"
+        )
+        event.container.create_receiver(
+            self.connection, "queue://proton-transactions"
+        )
+        event.container.declare_transaction(self.connection, handler=self)
+        event.reactor.schedule(TIMEOUT, self)
+
+    def send_when_ready(self):
+        if self.transaction and self.sender.credit and self.delivery is None:
+            self.delivery = self.transaction.send(
+                self.sender, Message(body=self.phase), tag=self.phase
+            )
+
+    def on_sendable(self, event):
+        self.send_when_ready()
+
+    def on_transaction_declared(self, event):
+        self.transaction = event.transaction
+        self.send_when_ready()
+
+    def on_settled(self, event):
+        if event.delivery == self.delivery:
+            if self.phase == "abort":
+                self.transaction.abort()
+            else:
+                self.transaction.commit()
+
+    def on_transaction_aborted(self, event):
+        self.phase = "commit"
+        self.transaction = None
+        self.delivery = None
+        event.container.declare_transaction(self.connection, handler=self)
+
+    def finish(self, event):
+        if self.committed and self.received:
+            self.connection.close()
+            event.container.stop()
+
+    def on_transaction_committed(self, event):
+        self.committed = True
+        self.finish(event)
+
+    def on_message(self, event):
+        if event.message.body != "commit" or self.received:
+            self.failure = AssertionError(
+                f"unexpected transactional delivery: {event.message.body!r}"
+            )
+            self.connection.close()
+            event.container.stop()
+            return
+        event.delivery.update(Delivery.ACCEPTED)
+        event.delivery.settle()
+        self.received = True
+        self.finish(event)
+
+    def on_transport_error(self, event):
+        self.failure = AssertionError(str(event.transport.condition))
+        self.connection.close()
+        event.container.stop()
+
+    def on_timer_task(self, event):
+        self.failure = TimeoutError("transactional commit/rollback timed out")
+        self.connection.close()
+        event.container.stop()
+
+
+def run_transactions():
+    test = TransactionProbe()
+    Container(test).run()
+    if test.failure:
+        raise test.failure
+    assert test.committed and test.received
+    print("PASS transactional send commit and rollback", flush=True)
+
+
+def run_durable_reconnect():
+    address = "topic://proton-durable"
+    client_id = "proton-durable-reconnect"
+
+    def connect():
+        container = Container()
+        container.container_id = client_id
+        return BlockingConnection(
+            URL, container=container, timeout=TIMEOUT, reconnect=False
+        )
+
+    connection = connect()
+    try:
+        connection.create_receiver(
+            address, name="saved", options=DurableSubscription()
+        )
+    finally:
+        connection.close()
+
+    producer = BlockingConnection(URL, timeout=TIMEOUT, reconnect=False)
+    try:
+        sender = producer.create_sender(address)
+        sender.send(Message(body="published-while-offline", durable=True))
+    finally:
+        producer.close()
+
+    connection = connect()
+    try:
+        receiver = connection.create_receiver(
+            address, name="saved", options=DurableSubscription()
+        )
+        message = receiver.receive(timeout=TIMEOUT)
+        assert message.body == "published-while-offline", message.body
+        receiver.accept()
+        receiver.close()
+    finally:
+        connection.close()
+    print("PASS durable subscription reconnect and offline delivery", flush=True)
+
+
 def main():
+    run_transactions()
+    run_durable_reconnect()
     run_roundtrip(
         "queue send/receive",
         "queue://proton-queue",

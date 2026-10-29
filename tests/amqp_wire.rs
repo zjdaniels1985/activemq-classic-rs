@@ -75,6 +75,96 @@ fn amqp_config() -> AppConfig {
     config
 }
 
+#[tokio::test]
+async fn transaction_coordinator_uses_dispositions_for_symbolic_commands() {
+    let broker = runtime::start(amqp_config()).await.unwrap();
+    let mut client = TcpStream::connect(broker.address("amqp").unwrap())
+        .await
+        .unwrap();
+    client.write_all(b"AMQP\0\x01\0\0").await.unwrap();
+    let mut header = [0; 8];
+    client.read_exact(&mut header).await.unwrap();
+    client
+        .write_all(&frame(&described(0x10, vec![string("tx-wire-client")])))
+        .await
+        .unwrap();
+    read_frame(&mut client).await.unwrap();
+    client
+        .write_all(&frame(&described(
+            0x11,
+            vec![vec![0x40], uint(0), uint(100), uint(100)],
+        )))
+        .await
+        .unwrap();
+    let begin = read_frame(&mut client).await.unwrap();
+    assert!(
+        begin.windows(3).any(|bytes| bytes == [0x60, 0, 0]),
+        "remote-channel must be encoded as ushort: {begin:?}"
+    );
+    client
+        .write_all(&frame(&described(
+            0x12,
+            vec![
+                string("coordinator"),
+                uint(0),
+                vec![0x42],
+                vec![0x50, 2],
+                vec![0x50, 0],
+                vec![0x40],
+                described(0x30, vec![]),
+                vec![0x40],
+                vec![0x40],
+                uint(0),
+            ],
+        )))
+        .await
+        .unwrap();
+    read_frame(&mut client).await.unwrap();
+    read_frame(&mut client).await.unwrap();
+    for (delivery_id, rollback) in [(0, false), (2, true)] {
+        let mut transfer = described(
+            0x14,
+            vec![uint(0), uint(delivery_id), binary(b"declare"), uint(0)],
+        );
+        transfer.extend_from_slice(&[0x00, 0x53, 0x77, 0x00]);
+        transfer.extend(symbol("amqp:declare:list"));
+        transfer.push(0x45);
+        client.write_all(&frame(&transfer)).await.unwrap();
+        let declared = read_frame(&mut client).await.unwrap();
+        assert_eq!(&declared[..3], &[0x00, 0x53, 0x15]);
+        assert!(
+            declared.windows(3).any(|bytes| bytes == [0x00, 0x53, 0x33]),
+            "expected declared outcome: {declared:?}"
+        );
+        let mut discharge = vec![0x00];
+        discharge.extend(symbol("amqp:discharge:list"));
+        let mut fields = binary(&delivery_id.to_be_bytes());
+        fields.push(if rollback { 0x41 } else { 0x42 });
+        discharge.extend([0xc0, (fields.len() + 1) as u8, 2]);
+        discharge.extend(fields);
+        let mut transfer = described(
+            0x14,
+            vec![
+                uint(0),
+                uint(delivery_id + 1),
+                binary(b"discharge"),
+                uint(0),
+            ],
+        );
+        transfer.extend([0x00, 0x53, 0x77]);
+        transfer.extend(discharge);
+        client.write_all(&frame(&transfer)).await.unwrap();
+        let accepted = read_frame(&mut client).await.unwrap();
+        assert_eq!(&accepted[..3], &[0x00, 0x53, 0x15]);
+        assert!(
+            accepted.windows(3).any(|bytes| bytes == [0x00, 0x53, 0x24]),
+            "expected accepted outcome: {accepted:?}"
+        );
+    }
+    drop(client);
+    broker.stop();
+}
+
 async fn sasl_exchange(mechanism: &str, auth: &[u8], config: AppConfig, accepted: bool) {
     let broker = runtime::start(config).await.unwrap();
     let mut client = TcpStream::connect(broker.address("amqp").unwrap())

@@ -33,6 +33,40 @@ async fn send(client: &mut OpenWireClient, destination: &Destination, text: &str
 }
 
 #[tokio::test]
+async fn stopping_broker_closes_bridge_connections_and_consumers() {
+    let _guard = NETWORK_TEST_LOCK.lock().await;
+    let remote = activemq_classic_rs::runtime::start(broker_config())
+        .await
+        .unwrap();
+    let mut config = broker_config();
+    config.network_connectors.push(NetworkConnectorConfig {
+        name: "shutdown".into(),
+        uris: vec![format!("tcp://{}", remote.address("openwire").unwrap())],
+        static_included_destinations: vec!["queue://shutdown.jobs".into()],
+        reconnect_delay_ms: 100,
+        ..NetworkConnectorConfig::default()
+    });
+    let local = activemq_classic_rs::runtime::start(config).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while remote.core.connections().len() < 2 || local.core.consumers().is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("bridge did not connect");
+    let core = local.core.clone();
+    local.stop();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !remote.core.connections().is_empty() || !core.consumers().is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("stopped bridge retained connections or consumers");
+    remote.stop();
+}
+
+#[tokio::test]
 async fn static_and_demand_queue_topic_bridges_apply_exclusions_and_keep_idle_queues_local() {
     let _guard = NETWORK_TEST_LOCK.lock().await;
     let remote = activemq_classic_rs::runtime::start(broker_config())
