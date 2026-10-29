@@ -16,6 +16,54 @@ use super::types::{
 };
 
 impl BrokerCore {
+    /// Replays the retained snapshot to an existing topic consumer without
+    /// replacing its subscription, pending messages or in-flight deliveries.
+    pub fn replay_retained(
+        &self,
+        connection: ConnectionId,
+        consumer: ConsumerId,
+    ) -> Result<(), CoreError> {
+        let mut inner = self.lock();
+        let principal = inner.principal(connection)?;
+        let state = inner
+            .consumers
+            .get(&consumer)
+            .filter(|state| state.connection == connection)
+            .ok_or_else(|| CoreError::NotFound(format!("consumer {consumer}")))?;
+        let destination = state.options.destination.clone();
+        if !destination.is_topic() || state.options.browser {
+            return Err(CoreError::IllegalState(
+                "retained replay requires a topic subscription".into(),
+            ));
+        }
+        self.check_access(&inner, &principal, &destination, Permission::Read)?;
+        let keys = state.queues.clone();
+        let now = now_millis();
+        let retained = inner
+            .retained
+            .values()
+            .filter(|message| !message.is_expired(now))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in keys {
+            for message in &retained {
+                if inner
+                    .queues
+                    .get(&key)
+                    .and_then(|queue| queue.filter.as_ref())
+                    .is_some_and(|filter| filter.accepts(message))
+                {
+                    let mut copy = message.clone();
+                    // A replay is a new delivery, not a retransmission of an
+                    // outstanding MQTT packet with the retained message's ID.
+                    copy.message_id = super::message::generate_message_id();
+                    self.enqueue(&mut inner, &key, Arc::new(copy))?;
+                }
+            }
+        }
+        self.flush_batch(&mut inner)
+    }
+
     pub(crate) fn advisory_message(&self, topic: Destination, data: AdvisoryData) -> Message {
         let mut message = Message::new(topic, Body::Empty);
         message.persistent = false;

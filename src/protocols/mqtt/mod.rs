@@ -314,7 +314,11 @@ impl Client {
         }
         if let Some(existing) = self.subscriptions.get(topic) {
             if existing.qos == qos {
-                return Ok(());
+                return self
+                    .context
+                    .core
+                    .replay_retained(self.id, existing.consumer)
+                    .map_err(io::Error::other);
             }
             self.unsubscribe(topic)?;
         }

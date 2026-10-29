@@ -64,6 +64,47 @@ fn opts(destination: Destination) -> ConsumerOptions {
 }
 
 #[test]
+fn retained_replay_checks_ownership_filters_and_expiration() {
+    let core = core_with(no_advisories());
+    let (connection, mut rx) = client(&core, None);
+    let (other, _) = client(&core, None);
+    let destination = Destination::topic("replay.snapshot");
+    for (name, color, expiration) in [
+        ("match", "blue", 0),
+        ("filtered", "red", 0),
+        ("expired", "blue", 1),
+    ] {
+        let mut message = Message::text(destination.clone(), name);
+        message
+            .properties
+            .insert(RETAIN_PROPERTY.into(), Value::Bool(true));
+        message.properties.insert("color".into(), color.into());
+        message.destination = Destination::topic(format!("replay.{name}"));
+        message.expiration = expiration;
+        core.send(connection, message, None).unwrap();
+    }
+    let consumer = core
+        .subscribe(
+            connection,
+            ConsumerOptions {
+                selector: Some("color = 'blue'".into()),
+                ..opts(Destination::topic("replay.>"))
+            },
+        )
+        .unwrap();
+    deliveries(&mut rx);
+    assert!(core.replay_retained(other, consumer).is_err());
+    core.replay_retained(connection, consumer).unwrap();
+    let replayed = deliveries(&mut rx);
+    assert_eq!(texts(&replayed), vec!["match"]);
+    assert_eq!(replayed[0].consumer, consumer);
+    let queue = core
+        .subscribe(connection, opts(Destination::queue("not-a-topic")))
+        .unwrap();
+    assert!(core.replay_retained(connection, queue).is_err());
+}
+
+#[test]
 fn queue_round_robin_and_ack() {
     let core = core_with(no_advisories());
     let (conn, mut rx) = client(&core, None);

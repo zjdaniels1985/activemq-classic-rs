@@ -224,6 +224,50 @@ async fn qos_zero_one_two_and_deduplication() {
 }
 
 #[tokio::test]
+async fn repeated_subscribe_replays_retained_without_replacing_inflight_packets() {
+    let broker = runtime::start(config()).await.unwrap();
+    let address = broker.address("mqtt").unwrap();
+    let (mut publisher, _) = Client::connect(address, "replay-publisher", true).await;
+    for (id, topic) in [(1, "replay/a"), (2, "replay/b")] {
+        publisher.publish(topic, b"saved", 1, true, id).await;
+        assert_eq!(publisher.read().await.0, 0x40);
+    }
+    let (mut subscriber, _) = Client::connect(address, "replay-durable", false).await;
+    subscriber.subscribe("replay/#", 1).await;
+    let mut original_ids = Vec::new();
+    for _ in 0..2 {
+        let (header, _, body, id) = subscriber.received().await;
+        assert_eq!(header, 0x33);
+        assert_eq!(body, b"saved");
+        original_ids.push(id);
+    }
+    let consumer = broker.core.consumers()[0].id;
+    for _ in 0..2 {
+        subscriber.subscribe("replay/#", 1).await;
+        for _ in 0..2 {
+            let (header, _, body, id) = subscriber.received().await;
+            assert_eq!(header, 0x33, "a new replay must not have DUP set");
+            assert_eq!(body, b"saved");
+            assert!(
+                !original_ids.contains(&id),
+                "replay reused an in-flight packet ID"
+            );
+            subscriber.send(0x40, &id.to_be_bytes()).await;
+        }
+        assert_eq!(broker.core.consumers()[0].id, consumer);
+        assert_eq!(broker.core.durable_subscriptions().len(), 1);
+    }
+    for id in original_ids {
+        subscriber.send(0x40, &id.to_be_bytes()).await;
+    }
+    subscriber.send(0xc0, &[]).await;
+    assert_eq!(subscriber.read().await, (0xd0, vec![]));
+    subscriber.disconnect().await;
+    publisher.disconnect().await;
+    broker.stop();
+}
+
+#[tokio::test]
 async fn retained_clear_will_and_cross_protocol_mapping() {
     let broker = runtime::start(config()).await.unwrap();
     let a = broker.address("mqtt").unwrap();

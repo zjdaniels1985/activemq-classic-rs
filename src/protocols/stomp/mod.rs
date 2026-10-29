@@ -1,5 +1,7 @@
 //! STOMP 1.0, 1.1 and 1.2 transport adapter.
 
+mod map_json;
+
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
@@ -572,8 +574,11 @@ async fn process_frame<W: AsyncWrite + Unpin>(
             let content_type = header(frame, "content-type", version)?;
             let as_bytes = frame.header("content-length").is_some()
                 || frame.header("amq-msg-type") == Some("bytes");
+            let transformation = header(frame, "transformation", version)?;
             let body = if as_bytes {
                 Body::Bytes(frame.body.clone())
+            } else if transformation.as_deref() == Some("jms-map-json") {
+                Body::Map(map_json::decode(&frame.body)?)
             } else {
                 Body::Text(String::from_utf8_lossy(&frame.body).into_owned())
             };
