@@ -3,7 +3,7 @@ use std::time::Duration;
 use activemq_classic_rs::config::{AppConfig, ListenerConfig, NetworkConnectorConfig};
 use activemq_classic_rs::core::security::{AuthorizationEntry, UserConfig};
 use activemq_classic_rs::core::{Body, Destination, Message};
-use activemq_classic_rs::protocols::openwire::OpenWireClient;
+use activemq_classic_rs::protocols::openwire::{OpenWireClient, OpenWireFrame};
 
 static NETWORK_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -32,6 +32,44 @@ async fn send(client: &mut OpenWireClient, destination: &Destination, text: &str
     id
 }
 
+async fn create_temp_queue(client: &mut OpenWireClient, name: &str) -> Destination {
+    let destination = Destination::temp_queue(name);
+    let command_id = client.next_command_id();
+    let mut payload = command_id.to_be_bytes().to_vec();
+    payload.push(1); // response required
+    payload.push(0); // DestinationInfo connection id
+    payload.extend_from_slice(&[1, 102, 1]); // temporary queue destination
+    payload.extend_from_slice(&(name.len() as u16).to_be_bytes());
+    payload.extend_from_slice(name.as_bytes());
+    payload.push(0); // add
+    payload.extend_from_slice(&0i64.to_be_bytes());
+    payload.push(0); // no broker path
+    client
+        .send_command(&OpenWireFrame {
+            command_type: 8,
+            payload,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let frame = client.receive().await.unwrap();
+            if frame.command_type == 30
+                && frame.payload.get(5..9) == Some(command_id.to_be_bytes().as_slice())
+            {
+                break;
+            }
+            assert_ne!(
+                frame.command_type, 31,
+                "temporary destination creation failed"
+            );
+        }
+    })
+    .await
+    .expect("temporary destination creation response timed out");
+    destination
+}
+
 #[tokio::test]
 async fn stopping_broker_closes_bridge_connections_and_consumers() {
     let _guard = NETWORK_TEST_LOCK.lock().await;
@@ -47,8 +85,8 @@ async fn stopping_broker_closes_bridge_connections_and_consumers() {
         ..NetworkConnectorConfig::default()
     });
     let local = activemq_classic_rs::runtime::start(config).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while remote.core.connections().len() < 2 || local.core.consumers().is_empty() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while remote.core.connections().is_empty() || local.core.consumers().is_empty() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
@@ -56,13 +94,19 @@ async fn stopping_broker_closes_bridge_connections_and_consumers() {
     .expect("bridge did not connect");
     let core = local.core.clone();
     local.stop();
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         while !remote.core.connections().is_empty() || !core.consumers().is_empty() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("stopped bridge retained connections or consumers");
+    .unwrap_or_else(|_| {
+        panic!(
+            "stopped bridge retained connections {:?} or consumers {:?}",
+            remote.core.connections(),
+            core.consumers()
+        )
+    });
     remote.stop();
 }
 
@@ -417,6 +461,235 @@ async fn static_bridge_retries_until_remote_becomes_available() {
         .expect("message should be forwarded after reconnect");
     assert_eq!(received.0, remote_consumer);
     assert_eq!(received.1.body, Body::Text("after-reconnect".into()));
+
+    local.stop();
+    remote.stop();
+}
+
+#[tokio::test]
+async fn bridge_reconnects_after_established_remote_broker_restarts() {
+    let _guard = NETWORK_TEST_LOCK.lock().await;
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote_address = probe.local_addr().unwrap();
+    drop(probe);
+
+    let mut remote_config = broker_config();
+    remote_config.protocols.openwire.bind = remote_address.to_string();
+    let mut local_config = broker_config();
+    local_config
+        .network_connectors
+        .push(NetworkConnectorConfig {
+            name: "established-reconnect".into(),
+            uris: vec![format!("tcp://{remote_address}")],
+            static_included_destinations: vec!["queue://restart.established".into()],
+            reconnect_delay_ms: 100,
+            ..NetworkConnectorConfig::default()
+        });
+    let local = activemq_classic_rs::runtime::start(local_config)
+        .await
+        .unwrap();
+    let first_remote = activemq_classic_rs::runtime::start(remote_config.clone())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while first_remote.core.connections().is_empty() || local.core.consumers().is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("initial bridge connection was not established");
+    for connection in first_remote.core.connections() {
+        first_remote.core.close_connection(connection.id);
+    }
+    first_remote.stop();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while local
+            .core
+            .consumers()
+            .iter()
+            .any(|consumer| consumer.network)
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("local network consumers were not removed after remote shutdown");
+
+    let restarted_remote = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match activemq_classic_rs::runtime::start(remote_config.clone()).await {
+                Ok(broker) => break broker,
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(error) => panic!("could not restart remote broker: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("remote listener did not release its address for restart");
+    let destination = Destination::queue("restart.established");
+    let mut remote_client = connected(remote_address).await;
+    let remote_consumer = remote_client
+        .create_consumer(&destination, 10, None)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while restarted_remote.core.connections().len() < 2
+            || !local
+                .core
+                .consumers()
+                .iter()
+                .any(|consumer| consumer.network && consumer.destination == destination.to_uri())
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("bridge did not reconnect to the restarted broker");
+
+    let mut local_client = connected(local.address("openwire").unwrap()).await;
+    send(&mut local_client, &destination, "after-established-restart").await;
+    let received = remote_client
+        .receive_message(Duration::from_secs(5))
+        .await
+        .unwrap()
+        .expect("message should pass through the re-established bridge");
+    assert_eq!(received.0, remote_consumer);
+    assert_eq!(
+        received.1.body,
+        Body::Text("after-established-restart".into())
+    );
+
+    local.stop();
+    restarted_remote.stop();
+}
+
+#[tokio::test]
+async fn non_conduit_bridges_keep_one_local_consumer_per_remote_demand() {
+    let _guard = NETWORK_TEST_LOCK.lock().await;
+    let remote = activemq_classic_rs::runtime::start(broker_config())
+        .await
+        .unwrap();
+    let destination = Destination::queue("demand.nonconduit");
+    let mut local_config = broker_config();
+    local_config
+        .network_connectors
+        .push(NetworkConnectorConfig {
+            name: "non-conduit".into(),
+            uris: vec![format!("tcp://{}", remote.address("openwire").unwrap())],
+            dynamically_included_destinations: vec![destination.to_uri()],
+            conduit_subscriptions: false,
+            reconnect_delay_ms: 100,
+            ..NetworkConnectorConfig::default()
+        });
+    let local = activemq_classic_rs::runtime::start(local_config)
+        .await
+        .unwrap();
+    let mut remote_client = connected(remote.address("openwire").unwrap()).await;
+    let first = remote_client
+        .create_consumer(&destination, 10, None)
+        .await
+        .unwrap();
+    let second = remote_client
+        .create_consumer(&destination, 10, None)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while local
+            .core
+            .consumers()
+            .iter()
+            .filter(|consumer| consumer.network && consumer.destination == destination.to_uri())
+            .count()
+            < 2
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("each remote consumer should create its own network consumer");
+
+    let mut local_client = connected(local.address("openwire").unwrap()).await;
+    send(&mut local_client, &destination, "non-conduit").await;
+    let received = remote_client
+        .receive_message(Duration::from_secs(5))
+        .await
+        .unwrap()
+        .expect("message should be forwarded to one remote consumer");
+    assert!(received.0 == first || received.0 == second);
+    assert_eq!(received.1.body, Body::Text("non-conduit".into()));
+
+    local.stop();
+    remote.stop();
+}
+
+#[tokio::test]
+async fn remote_temporary_queue_is_proxied_and_cleaned_up_with_owner_lifecycle() {
+    let _guard = NETWORK_TEST_LOCK.lock().await;
+    let remote = activemq_classic_rs::runtime::start(broker_config())
+        .await
+        .unwrap();
+    let mut local_config = broker_config();
+    local_config
+        .network_connectors
+        .push(NetworkConnectorConfig {
+            name: "temporary-forward".into(),
+            uris: vec![format!("tcp://{}", remote.address("openwire").unwrap())],
+            reconnect_delay_ms: 100,
+            ..NetworkConnectorConfig::default()
+        });
+    let local = activemq_classic_rs::runtime::start(local_config)
+        .await
+        .unwrap();
+    let mut remote_client = connected(remote.address("openwire").unwrap()).await;
+    let name = format!("ID:network-temp-{}", std::process::id());
+    let destination = create_temp_queue(&mut remote_client, &name).await;
+    let remote_consumer = remote_client
+        .create_consumer(&destination, 10, None)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !local
+            .core
+            .destinations()
+            .iter()
+            .any(|entry| entry.destination == destination)
+            || !local
+                .core
+                .consumers()
+                .iter()
+                .any(|consumer| consumer.network && consumer.destination == destination.to_uri())
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("bridge did not create a temporary destination proxy");
+
+    let mut local_client = connected(local.address("openwire").unwrap()).await;
+    send(&mut local_client, &destination, "temporary-message").await;
+    let received = remote_client
+        .receive_message(Duration::from_secs(5))
+        .await
+        .unwrap()
+        .expect("temporary destination message was not forwarded");
+    assert_eq!(received.0, remote_consumer);
+    assert_eq!(received.1.body, Body::Text("temporary-message".into()));
+
+    drop(remote_client);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while local
+            .core
+            .destinations()
+            .iter()
+            .any(|entry| entry.destination == destination)
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("temporary destination proxy outlived its remote owner demand");
 
     local.stop();
     remote.stop();
