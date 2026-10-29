@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use base64::Engine;
 use serde_json::Value as Json;
 
 use crate::core::Value;
@@ -106,6 +107,10 @@ fn typed_value(kind: &str, json: &Json) -> Result<Value, String> {
             }
         }
         "null" if text.is_empty() => Ok(Value::Null),
+        "byte-array" => base64::engine::general_purpose::STANDARD
+            .decode(text)
+            .map(Value::Bytes)
+            .map_err(|error| format!("invalid byte-array map value: {error}")),
         _ => Err(format!("unsupported JMS map type {kind:?}")),
     }
 }
@@ -124,6 +129,7 @@ mod tests {
             {"string":"enabled","boolean":true},
             {"string":"price","double":1.5},
             {"string":"letter","char":"A"},
+            {"string":"binary","byte-array":"AP9B"},
             {"string":"empty","null":""}
         ]}}"#,
         )
@@ -134,6 +140,7 @@ mod tests {
         assert_eq!(map["enabled"], Value::Bool(true));
         assert_eq!(map["price"], Value::Double(1.5));
         assert_eq!(map["letter"], Value::Char(65));
+        assert_eq!(map["binary"], Value::Bytes(vec![0, 255, 65]));
         assert_eq!(map["empty"], Value::Null);
         assert_eq!(decode(br#"{"a":42}"#).unwrap()["a"], Value::Long(42));
         assert!(decode(br#"{"map":{}}"#).unwrap().is_empty());
