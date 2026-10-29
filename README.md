@@ -137,3 +137,12 @@ cargo clippy --all-targets -- -D warnings
 Third-party client checks live under `tests/interop/`. Follow each harness's
 dependency/setup instructions. Core unit tests and protocol TCP tests run with
 `cargo test`.
+
+To check STOMP map JSON against an unmodified Java JMS client, set
+`AMQ_CLASSPATH` to the ActiveMQ 6.2.6 client and its runtime dependency jars,
+enable both listeners, and run:
+
+```sh
+java --class-path "$AMQ_CLASSPATH" tests/interop/stomp/MapJsonCheck.java \
+  tcp://127.0.0.1:61616 61613
+```
