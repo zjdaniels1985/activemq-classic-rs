@@ -28,8 +28,10 @@ pub fn init(config: &LoggingConfig) -> io::Result<()> {
         .with_target(true);
     let result = match &config.file {
         Some(path) => {
-            if let Some(parent) = std::path::Path::new(path).parent() {
-                std::fs::create_dir_all(parent).ok();
+            if let Some(parent) = std::path::Path::new(path).parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(parent)?;
             }
             let file = OpenOptions::new().create(true).append(true).open(path)?;
             let builder = builder.with_ansi(false).with_writer(Mutex::new(file));

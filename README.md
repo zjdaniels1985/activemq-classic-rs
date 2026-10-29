@@ -1,71 +1,126 @@
 # activemq-classic-rs
 
-A Rust broker prototype targeting Apache ActiveMQ Classic compatibility. The
-goal is to preserve existing Java-client interoperability through compatible
-wire protocols while providing Rust-native APIs instead of translating the
-Java-only JMS API.
+A runnable Rust message broker targeting Apache ActiveMQ Classic wire-protocol
+compatibility. Existing Java clients use compatible protocols; the Rust-native
+API is `core::BrokerCore`, not a translation of the Java JMS API.
 
-## Current status
+**This is not yet a drop-in replacement for ActiveMQ Classic.** Compatibility
+is evolving; do not expose this development broker to untrusted networks.
 
-This is an early, incomplete implementation and is **not** a drop-in replacement
-for ActiveMQ Classic. The current network path implements a limited OpenWire
-queue workflow (connection setup, queue producers/consumers, dispatch, and
-acknowledgements). Persistent messages are stored in Sled and recovered after a
-restart. A basic Rust-built web console lists queue depths and purges queues.
-Structured logs use `tracing`. The limited queue send/receive path has been
-smoke-tested with the ActiveMQ 6.2.6 Java client; this does not imply full
-OpenWire compatibility.
+## Implemented
 
-Topics, selectors, transactions, security, scheduled delivery, temporary
-destinations, broker networking, and AMQP, MQTT, and STOMP adapters are not
-implemented. Enabling one of those protocol listeners is rejected at startup;
-the configuration sections reserve room for those future adapters. The broker
-has not achieved full ActiveMQ Classic feature or behavioral parity and should
-not be exposed to untrusted networks.
+- Queues and topics, wildcard/composite destinations, durable subscriptions,
+  temporary destinations, virtual topics, noLocal and queue browsers.
+- SQL-92 selectors, message priority, exclusive consumers, message groups,
+  expiration, redelivery and dead-letter queues.
+- Local transactions and recoverable prepared XA transactions.
+- Username/password authentication and destination/group authorization.
+- Persistent scheduled delivery (`AMQ_SCHEDULED_DELAY`, `PERIOD`, `REPEAT`,
+  `CRON`) and scheduler management.
+- Sled persistence and restart recovery; an optional in-memory backend.
+- OpenWire with loose encoding, STOMP 1.0–1.2 and MQTT 3.1/3.1.1 TCP adapters.
+- An embedded Rust/Axum administrative web console and JSON API.
+- Configurable structured logging with text/JSON output and optional log files.
+
+OpenWire interoperability has been exercised with the ActiveMQ 6.2.6 Java
+client, including topics, transactions, durable subscriptions, selectors,
+temporary destinations, scheduling and XA. STOMP and MQTT interoperability
+harnesses use `stomp.py` and `paho-mqtt`. These checks do not establish complete
+Classic behavioral parity.
+
+AMQP 1.0 and broker networking are being integrated; their current listener and
+configuration scaffolding alone does not establish protocol support.
 
 ## Build and run
 
-Requires Rust 1.85 or newer.
+Use a current stable Rust toolchain supporting edition 2024 and let-chains.
 
 ```sh
-cargo test
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo run
-```
-
-By default the executable reads `./activemq-rust.toml` when it exists and
-otherwise uses built-in defaults. Override it with `--config PATH`. OpenWire
-defaults to `127.0.0.1:61616`, Sled data to `./data/sled`, and the web console to
-`http://127.0.0.1:8161/`. For example:
-
-```sh
+cargo build --release
 cargo run -- --config activemq-rust.toml
 cargo run -- --bind 127.0.0.1:61617 --data-dir ./data/test
+cargo run -- --in-memory
 ```
 
-Set `RUST_LOG` to control structured log levels, for example
-`RUST_LOG=debug cargo run`.
+The executable loads `./activemq-rust.toml` when present, otherwise built-in
+defaults. `--help` describes command-line overrides. Default listener addresses:
 
-## Configuration
+| Transport | Address |
+|---|---|
+| OpenWire | `127.0.0.1:61616` |
+| STOMP | `127.0.0.1:61613` |
+| MQTT | `127.0.0.1:1883` |
+| AMQP (integration in progress) | `127.0.0.1:5672` |
+| Web console | `http://127.0.0.1:8161/` |
 
-`activemq-rust.toml` contains broker identity and frame-size limits, individual
-protocol listener settings, the persistence backend/path, and web-console
-settings. Keep unimplemented protocols disabled; the broker fails clearly
-rather than silently ignoring an enabled listener. Sled is currently the only
-supported persistence backend.
+Set `enabled = false` for any unused protocol or console. Sled defaults to
+`./data/sled`; give each broker its own data directory.
 
-The web console supports queue listing and queue purge. Binding it to a
-non-loopback address requires a non-empty `web_console.admin_token`; the
-browser console will prompt for that bearer token. Remote console traffic is
-plain HTTP, so use a trusted network or a TLS-terminating reverse proxy.
+## Configuration and security
 
-## Compatibility roadmap
+`activemq-rust.toml` documents broker identity, frame/connection limits,
+destination policies, authentication/authorization, protocol-specific options,
+persistence, the console, logging and network connectors. Unknown protocol
+sections fail validation rather than being silently accepted.
 
-1. Expand OpenWire compatibility and test against supported ActiveMQ Java clients.
-2. Add Classic queue/topic semantics, transactions, selectors, security,
-   redelivery policies, scheduling, and temporary destinations.
-3. Implement the configured protocol adapters and operational features.
-4. Continue compatibility and behavioral testing against ActiveMQ Classic.
+Security is disabled by default for local development. Enable `[security]`,
+configure users and explicit `queue://`, `topic://`, `temp-queue://` or
+`temp-topic://` authorization patterns before accepting remote clients.
+Creating destinations requires admin authorization as well as read/write
+access. Passwords may be configured directly or as SHA-256 digests; these
+unsalted digests are not a substitute for a production credential store.
 
-The roadmap describes planned work, not capabilities of the current broker.
+MQTT persistent-session subscriptions and queued persistent messages use Sled.
+Set `protocols.mqtt.options.session_state_dir` to a broker-specific directory
+to also journal packet identifiers and QoS handshake state across restarts.
+Back up that directory together with the Sled store. See
+[`src/protocols/mqtt/README.md`](src/protocols/mqtt/README.md) for wire-session
+persistence guarantees and limitations.
+
+Logging uses `[logging]` (`level`, `format = "text" | "json"`, `file`, `ansi`).
+`RUST_LOG` overrides the configured level, for example:
+
+```sh
+RUST_LOG=info,activemq_classic_rs=debug cargo run
+```
+
+## Administration
+
+The console supports destination creation/deletion, browsing and sending,
+purge, message removal/move/DLQ retry, connections, consumers, durable
+subscriptions and scheduled jobs. Its REST API is under `/api`:
+`/broker`, `/destinations`, `/connections`, `/consumers`, `/subscriptions`
+and `/jobs`. Destination-specific routes use
+`/api/destinations/{kind}/{name}`; names and message IDs must be URL-encoded.
+
+A non-loopback console bind requires a nonempty `web_console.admin_token`.
+The browser's **Admin token** button sets the bearer token for API calls;
+non-browser callers use `Authorization: Bearer TOKEN`. The token grants full
+administrative access, independently of messaging user permissions.
+Transports and the console use plaintext TCP/HTTP; use trusted networks or
+appropriate TLS termination.
+
+## Known compatibility limits
+
+- OpenWire negotiation advertises up to version 12, but v1–v11 layouts are
+  not independently verified. Not all Classic commands/advisories are covered.
+- STOMP inbound map-JSON transformation is not decoded into a native map body.
+- Repeated MQTT SUBSCRIBE does not replay retained messages again. MQTT's
+  optional packet journal and core store are not an atomic persistence domain;
+  a crash at that boundary can duplicate QoS 2 routing.
+- TLS/WebSocket transports, discovery/multicast, JMX, XPath selectors,
+  retroactive consumers and MQTT 5 are unsupported.
+- Complete Classic plugin, management, storage, clustering and failure-mode
+  parity has not been established.
+
+## Development
+
+```sh
+cargo fmt --check
+cargo test
+cargo clippy --all-targets -- -D warnings
+```
+
+Third-party client checks live under `tests/interop/`. Follow each harness's
+dependency/setup instructions. Core unit tests and protocol TCP tests run with
+`cargo test`.
