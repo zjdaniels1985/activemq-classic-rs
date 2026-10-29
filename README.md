@@ -106,9 +106,15 @@ appropriate TLS termination.
 
 - OpenWire negotiation advertises up to version 12, but v1–v11 layouts are
   not independently verified. Not all Classic commands/advisories are covered.
-- STOMP inbound map-JSON transformation is not decoded into a native map body.
-- Repeated MQTT SUBSCRIBE does not replay retained messages again. MQTT's
-  optional packet journal and core store are not an atomic persistence domain;
+- STOMP `transformation:jms-map-json` SEND frames without `content-length`
+  decode Classic typed map entries or plain scalar JSON objects into native
+  map bodies. Invalid transformations return an ERROR frame; arbitrary object
+  deserialization and XML transformations are unsupported. As in Classic,
+  `content-length` selects a bytes message instead of applying the transformation.
+- Repeated MQTT SUBSCRIBE replays matching retained messages, including when
+  the subscription already exists. Same-QoS repeats preserve the consumer,
+  durable queue and outstanding packet identifiers. MQTT's optional packet
+  journal and core store are not an atomic persistence domain;
   a crash at that boundary can duplicate QoS 2 routing.
 - Network connectors require separate reverse connectors instead of duplex.
   Non-conduit subscriptions, temporary-destination forwarding and advisory

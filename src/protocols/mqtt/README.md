@@ -59,7 +59,9 @@ The adapter journal and core store are separate persistence domains: there is
 no atomic transaction between routing a QoS 2 publish and updating its journal.
 A process failure at that boundary can cause duplicate routing. Normal
 reconnects and orderly broker restarts preserve the handshake. Repeating an
-existing SUBSCRIBE does not currently replay retained entries a second time.
+existing SUBSCRIBE replays the matching retained snapshot. Same-QoS repeats
+keep the current subscription and in-flight packet state; each replay gets
+fresh delivery and packet identifiers rather than masquerading as a retransmit.
 
 ## Verification
 

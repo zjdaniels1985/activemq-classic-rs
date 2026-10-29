@@ -211,6 +211,9 @@ def checks(broker):
     retained = Client(broker, "retained-reader")
     retained.subscribe("retained/#", 2)
     retained.receive("retained/value", b"saved", 1, True)
+    retained.subscribe("retained/#", 2)
+    replay = retained.receive("retained/value", b"saved", 1, True)
+    assert not replay.dup, "repeated SUBSCRIBE must create a new retained delivery"
     retained.close()
     pub.publish("retained/value", b"", 1, True)
     cleared = Client(broker, "retained-cleared")

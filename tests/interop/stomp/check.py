@@ -5,6 +5,7 @@ Run against a broker listening on 127.0.0.1:61613, optionally passing HOST PORT.
 Set STOMP_USER and STOMP_PASSWORD to validate an enabled authentication config.
 """
 import os
+import json
 import sys
 import threading
 import time
@@ -70,8 +71,11 @@ class Listener(stomp.ConnectionListener):
                 self.changed.wait(remaining)
 
 
-def client(client_id=None, heartbeats=(0, 0)):
-    conn = stomp.Connection12([(HOST, PORT)], heartbeats=heartbeats, timeout=3)
+def client(client_id=None, heartbeats=(0, 0), auto_content_length=True):
+    conn = stomp.Connection12(
+        [(HOST, PORT)], heartbeats=heartbeats, timeout=3,
+        auto_content_length=auto_content_length,
+    )
     listener = Listener()
     conn.set_listener("check", listener)
     headers = {"client-id": client_id} if client_id else {}
@@ -182,6 +186,24 @@ def main():
     assert conn11.is_connected(), "negotiated 1.1 heartbeats did not keep the connection alive"
     conn11.disconnect(receipt="goodbye-11")
     conn.disconnect()
+
+    maps, map_listener = client(auto_content_length=False)
+    map_queue = f"/queue/maps.{suffix}"
+    maps.subscribe(map_queue, id="maps", ack="auto")
+    maps.send(
+        map_queue,
+        json.dumps({"map": {"entry": [
+            {"string": ["name", "order"]},
+            {"string": "count", "int": 42},
+            {"string": "enabled", "boolean": True},
+        ]}}),
+        headers={"transformation": "jms-map-json"},
+    )
+    transformed = map_listener.wait_message()
+    assert json.loads(transformed.body) == {
+        "name": "order", "count": 42, "enabled": True,
+    }, transformed.body
+    maps.disconnect()
 
     if os.getenv("STOMP_USER"):
         bad = stomp.Connection12([(HOST, PORT)], timeout=2)
