@@ -594,9 +594,7 @@ fn like_matches(pattern: &[LikePart], text: &[char]) -> bool {
                 }
             }
             LikePart::AnyOne => {
-                for index in 0..text.len() {
-                    next[index + 1] = current[index];
-                }
+                next[1..=text.len()].copy_from_slice(&current[..text.len()]);
             }
             LikePart::Literal(expected) => {
                 for index in 0..text.len() {

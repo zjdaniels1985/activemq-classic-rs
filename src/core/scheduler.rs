@@ -108,14 +108,13 @@ impl Job {
             self.next_time = fired_at;
             return true;
         }
-        if let Some(expression) = &self.cron {
-            if let Ok(schedule) = CronSchedule::parse(expression)
-                && let Some(next) = schedule.next_after(fired_at.max(self.next_time))
-            {
-                self.remaining = self.repeat;
-                self.next_time = next + self.delay;
-                return true;
-            }
+        if let Some(expression) = &self.cron
+            && let Ok(schedule) = CronSchedule::parse(expression)
+            && let Some(next) = schedule.next_after(fired_at.max(self.next_time))
+        {
+            self.remaining = self.repeat;
+            self.next_time = next + self.delay;
+            return true;
         }
         false
     }
