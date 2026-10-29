@@ -2,6 +2,7 @@
 
 pub mod broker;
 pub mod config;
+pub mod core;
 pub mod openwire;
 pub mod openwire_commands;
 pub mod server;
