@@ -1,0 +1,29 @@
+[broker]
+name = "activemq-classic-rs"
+max_frame_size = 104857600
+
+[protocols.openwire]
+enabled = true
+bind = "127.0.0.1:61616"
+
+[protocols.stomp]
+enabled = false
+bind = "127.0.0.1:61613"
+
+[protocols.amqp]
+enabled = false
+bind = "127.0.0.1:5672"
+
+[protocols.mqtt]
+enabled = false
+bind = "127.0.0.1:1883"
+
+[persistence]
+backend = "sled"
+path = "./data/sled"
+
+[web_console]
+enabled = true
+bind = "127.0.0.1:8161"
+# Required when binding the console to a non-loopback address.
+# admin_token = "set-a-long-random-secret"
