@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ActiveMQ Classic (Rust) Console</title>
+<style>
+:root{--fg:#172033;--muted:#5b6475;--line:#d5dae3;--accent:#a3122a;--bg:#f6f7f9}
+*{box-sizing:border-box}body{margin:0;font:14px system-ui,sans-serif;color:var(--fg);background:var(--bg)}
+header{background:var(--accent);color:#fff;padding:.8rem 1.5rem;display:flex;align-items:center;gap:1.5rem;flex-wrap:wrap}
+header h1{font-size:1.15rem;margin:0}nav a{color:#fff;margin-right:1rem;text-decoration:none;opacity:.85}
+nav a.active{opacity:1;font-weight:600;border-bottom:2px solid #fff}
+main{padding:1.2rem 1.5rem;max-width:1400px}
+table{border-collapse:collapse;width:100%;background:#fff;margin:.6rem 0 1.5rem}
+th,td{text-align:left;padding:.45rem .6rem;border-bottom:1px solid var(--line);vertical-align:top}
+th{background:#eef0f4;font-weight:600}td.num{text-align:right}
+button{cursor:pointer;margin:0 .2rem .2rem 0;padding:.2rem .55rem;border:1px solid var(--line);background:#fff;border-radius:3px}
+button.danger{color:#9b1c1c}input,textarea,select{font:inherit;padding:.3rem;border:1px solid var(--line);border-radius:3px}
+form.inline{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;margin:.5rem 0}
+#status{min-height:1.4em;color:#9b1c1c;margin:.3rem 0}.ok{color:#11632b!important}
+.muted{color:var(--muted)}pre{white-space:pre-wrap;margin:0;max-height:8em;overflow:auto}
+dl{display:grid;grid-template-columns:max-content auto;gap:.3rem 1rem;background:#fff;padding:1rem}
+dt{font-weight:600}
+</style>
+</head>
+<body>
+<header><h1>ActiveMQ Classic (Rust)</h1>
+<nav id="nav">
+<a href="#home">Home</a><a href="#queues">Queues</a><a href="#topics">Topics</a>
+<a href="#subscribers">Subscribers</a><a href="#connections">Connections</a>
+<a href="#scheduled">Scheduled</a><a href="#send">Send</a>
+</nav>
+<span style="margin-left:auto"><button id="token">Admin token</button></span>
+</header>
+<main><p id="status"></p><div id="view"></div></main>
+<script>
+"use strict";
+let token=sessionStorage.getItem("amqToken")||"";
+const $=s=>document.querySelector(s);
+const el=(tag,props={},...kids)=>{const e=document.createElement(tag);Object.assign(e,props);
+  for(const k of kids)e.append(k instanceof Node?k:document.createTextNode(k??""));return e};
+function status(text,ok){const s=$("#status");s.textContent=text||"";s.className=ok?"ok":""}
+async function api(path,opts={}){
+  const headers={"Content-Type":"application/json"};if(token)headers.Authorization="Bearer "+token;
+  const r=await fetch("/api"+path,{...opts,headers});
+  if(r.status===401){askToken();throw new Error("Unauthorized: set the admin token")}
+  const body=await r.json().catch(()=>null);
+  if(!r.ok)throw new Error(body&&body.error||("HTTP "+r.status));return body}
+function askToken(){const t=prompt("Admin token",token);if(t!==null){token=t;sessionStorage.setItem("amqToken",t);route()}}
+$("#token").onclick=askToken;
+const enc=encodeURIComponent;
+const destPath=d=>"/destinations/"+d.kind_scheme+"/"+enc(d.name);
+const scheme=k=>({Queue:"queue",Topic:"topic",TempQueue:"temp-queue",TempTopic:"temp-topic"})[k];
+const time=t=>t?new Date(t).toLocaleString():"";
+function table(headers,rows){return el("table",{},el("thead",{},el("tr",{},...headers.map(h=>el("th",{},h)))),
+  el("tbody",{},...rows.map(r=>el("tr",{},...r.map(c=>c instanceof Node?el("td",{},c):el("td",{className:typeof c==="number"?"num":""},String(c??"")))))))}
+function btn(label,fn,danger){return el("button",{className:danger?"danger":"",onclick:async()=>{
+  try{const m=await fn();if(m)status(m,true);}catch(e){status(e.message)}}},label)}
+function actions(...b){const s=el("span");s.append(...b);return s}
+
+async function home(v){
+  const b=await api("/broker");
+  const dl=el("dl");for(const[k,val]of[["Name",b.name],["Broker id",b.id],["Persistent (Sled)",b.persistent],
+    ["Store size",(b.store_size_bytes/1024).toFixed(1)+" KiB"],["Connections",b.connections],["Consumers",b.consumers],
+    ["Producers",b.producers],["Queues",b.queues],["Topics",b.topics],["Durable subscriptions",b.durable_subscriptions],
+    ["Scheduled jobs",b.scheduled_jobs],["Prepared XA transactions",b.prepared_transactions],["Broker time",time(b.time)]])
+    dl.append(el("dt",{},k),el("dd",{},String(val)));
+  v.append(el("h2",{},"Broker"),dl);
+}
+async function destinations(v,topic){
+  const all=(await api("/destinations")).filter(d=>topic?d.destination.kind.includes("Topic"):d.destination.kind.includes("Queue"));
+  const kind=topic?"topic":"queue";
+  const name=el("input",{placeholder:(topic?"Topic":"Queue")+" name",required:true});
+  const form=el("form",{className:"inline",onsubmit:async e=>{e.preventDefault();
+    try{await api("/destinations",{method:"POST",body:JSON.stringify({uri:kind+"://"+name.value})});status("Created",true);route()}catch(x){status(x.message)}}},
+    name,el("button",{type:"submit"},"Create"));
+  v.append(el("h2",{},topic?"Topics":"Queues"),form,table(
+    ["Name","Pending","Consumers","Producers","Enqueued","Dequeued","Dispatched","Expired","Operations"],
+    all.map(d=>{d.kind_scheme=scheme(d.destination.kind);d.name=d.destination.name;return[
+      d.name,d.pending,d.consumers,d.producers,d.enqueued,d.dequeued,d.dispatched,d.expired,actions(
+        btn("Browse",()=>{location.hash="#browse/"+d.kind_scheme+"/"+enc(d.name)}),
+        btn("Send to",()=>{location.hash="#send/"+d.kind_scheme+"/"+enc(d.name)}),
+        btn("Purge",async()=>{if(!confirm("Purge "+d.uri+"?"))return;const r=await api(destPath(d)+"/purge",{method:"POST"});route();return "Purged "+r.count},true),
+        btn("Delete",async()=>{if(!confirm("Delete "+d.uri+"?"))return;await api(destPath(d),{method:"DELETE"});route();return "Deleted"},true))]})));
+}
+async function browse(v,kind,name){
+  const d={kind_scheme:kind,name:decodeURIComponent(name)};const msgs=await api(destPath(d)+"/messages?limit=400");
+  const isDlq=/DLQ/.test(d.name);
+  v.append(el("h2",{},"Browse "+kind+"://"+d.name),table(
+    ["Message ID","Priority","Persistent","Timestamp","Redeliveries","Type","Properties","Body","Operations"],
+    msgs.map(m=>[m.message_id,m.priority,m.persistent,time(m.timestamp),m.redelivery_counter,m.message_type||"",
+      el("pre",{},Object.entries(m.properties).map(([k,x])=>k+"="+x).join("\n")),el("pre",{},m.body),actions(
+      btn("Delete",async()=>{await api(destPath(d)+"/messages/"+enc(m.message_id),{method:"DELETE"});route();return "Deleted"},true),
+      btn("Move",async()=>{const to=prompt("Move to (queue://NAME or topic://NAME)");if(!to)return;
+        await api(destPath(d)+"/messages/"+enc(m.message_id)+"/move",{method:"POST",body:JSON.stringify({to})});route();return "Moved"}),
+      ...(isDlq?[btn("Retry",async()=>{await api(destPath(d)+"/messages/"+enc(m.message_id)+"/retry",{method:"POST"});route();return "Retried"})]:[]))])));
+}
+async function subscribers(v){
+  const subs=await api("/subscriptions"),cons=await api("/consumers");
+  v.append(el("h2",{},"Durable topic subscribers"),table(["Client ID","Subscription","Destination","Selector","Active","Pending","Operations"],
+    subs.map(s=>[s.client_id,s.name,s.destination,s.selector||"",s.active,s.pending,actions(
+      btn("Delete",async()=>{if(!confirm("Delete subscription "+s.name+"?"))return;
+        await api("/subscriptions/"+enc(s.client_id)+"/"+enc(s.name),{method:"DELETE"});route();return "Deleted"},true))])),
+    el("h2",{},"Active consumers"),table(["ID","Connection","Destination","Selector","Prefetch","In flight","Durable","Network"],
+    cons.map(c=>[c.id,c.connection,c.destination,c.selector||"",c.prefetch,c.in_flight,c.durable_name||"",c.network])));
+}
+async function connections(v){
+  const cs=await api("/connections");
+  v.append(el("h2",{},"Connections"),table(["ID","Client ID","User","Protocol","Remote address","Connected","Consumers","Producers","Operations"],
+    cs.map(c=>[c.id,c.client_id||"",c.username,c.protocol,c.remote_address,time(c.connected_at),c.consumers,c.producers,actions(
+      btn("Close",async()=>{if(!confirm("Close connection "+c.id+"?"))return;await api("/connections/"+c.id,{method:"DELETE"});route();return "Closed"},true))])));
+}
+async function scheduled(v){
+  const jobs=await api("/jobs");
+  v.append(el("h2",{},"Scheduled messages"),table(["Job ID","Destination","Next run","Delay","Period","Repeat","Cron","Operations"],
+    jobs.map(j=>[j.id,j.destination,time(j.next_time),j.delay,j.period,j.repeat,j.cron||"",actions(
+      btn("Delete",async()=>{await api("/jobs/"+enc(j.id),{method:"DELETE"});route();return "Deleted"},true))])));
+}
+function send(v,kind,name){
+  const f=(label,input)=>el("label",{},label+" ",input);
+  const dest=el("input",{value:kind?kind+"://"+decodeURIComponent(name):"queue://",size:40});
+  const body=el("textarea",{rows:6,cols:70});const props=el("textarea",{rows:3,cols:70,placeholder:'{"key":"value"}'});
+  const persistent=el("input",{type:"checkbox",checked:true}),priority=el("input",{type:"number",min:0,max:9,value:4});
+  const corr=el("input"),type=el("input"),ttl=el("input",{type:"number",min:0}),delay=el("input",{type:"number",min:0}),count=el("input",{type:"number",min:1,value:1});
+  const form=el("form",{onsubmit:async e=>{e.preventDefault();
+    try{const [k,n]=dest.value.split("://");if(!n)throw new Error("Destination must be queue://NAME or topic://NAME");
+      const r=await api("/destinations/"+k+"/"+enc(n)+"/send",{method:"POST",body:JSON.stringify({body:body.value,
+        properties:props.value.trim()?JSON.parse(props.value):{},persistent:persistent.checked,priority:+priority.value,
+        correlation_id:corr.value||null,message_type:type.value||null,time_to_live:ttl.value?+ttl.value:null,
+        delay:delay.value?+delay.value:null,count:+count.value||1})});status("Sent "+r.count+" message(s)",true)}catch(x){status(x.message)}}},
+    ...[f("Destination",dest),f("Correlation ID",corr),f("Type",type),f("Persistent",persistent),f("Priority",priority),
+      f("Time to live (ms)",ttl),f("Delay (ms)",delay),f("Count",count),f("Properties (JSON)",props),f("Body",body)].map(x=>el("p",{},x)),
+    el("button",{type:"submit"},"Send"));
+  v.append(el("h2",{},"Send message"),form);
+}
+const routes={home,queues:v=>destinations(v,false),topics:v=>destinations(v,true),browse,subscribers,connections,scheduled,send};
+async function route(){
+  const [page,...args]=(location.hash.slice(1)||"home").split("/");
+  for(const a of document.querySelectorAll("#nav a"))a.classList.toggle("active",a.hash==="#"+page);
+  const v=el("div");try{await (routes[page]||home)(v,...args);$("#view").replaceChildren(v)}catch(e){status(e.message)}
+}
+window.onhashchange=()=>{status("");route()};route();
+</script>
+</body>
+</html>

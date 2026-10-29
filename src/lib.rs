@@ -1,12 +1,15 @@
-//! Rust-native broker core and protocol primitives for ActiveMQ Classic compatibility.
+//! ActiveMQ Classic compatible message broker written in Rust.
+//!
+//! * [`core`] – protocol-neutral broker engine (queues, topics, durable
+//!   subscriptions, transactions, selectors, security, scheduler, Sled store).
+//! * [`protocols`] – OpenWire, STOMP, MQTT and AMQP 1.0 adapters.
+//! * [`network`] – network-of-brokers bridges.
+//! * [`web_console`] – administrative web console and REST API.
 
-pub mod broker;
 pub mod config;
 pub mod core;
-pub mod openwire;
-pub mod openwire_commands;
-pub mod server;
-pub mod sled_store;
+pub mod logging;
+pub mod network;
+pub mod protocols;
+pub mod runtime;
 pub mod web_console;
-
-pub use broker::{Broker, BrokerError, Message};
