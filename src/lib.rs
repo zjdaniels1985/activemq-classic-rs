@@ -2,5 +2,6 @@
 
 pub mod broker;
 pub mod openwire;
+pub mod server;
 
 pub use broker::{Broker, BrokerError, Message};

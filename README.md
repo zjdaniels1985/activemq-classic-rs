@@ -7,11 +7,13 @@ the Java-only JMS API.
 
 ## Status
 
-This repository is at the foundation stage, not yet a usable or wire-compatible
-broker. The initial implementation contains a thread-safe in-memory FIFO queue
-core and a bounded OpenWire frame reader/writer. OpenWire command marshalling,
-connection negotiation, TCP transport, persistence, and protocol-level
-interoperability are not implemented yet.
+This repository is an early prototype, not yet an ActiveMQ Classic-compatible
+broker. It contains a thread-safe in-memory FIFO queue core, bounded OpenWire
+framing, and a TCP listener that negotiates OpenWire and reports broker identity.
+The listener acknowledges selected setup commands but does not yet implement
+message production/consumption, topics, persistence, transactions, security, or
+the rest of ActiveMQ Classic's broker semantics. Do not use it as a drop-in
+replacement or expose it to untrusted networks.
 
 ## Build and test
 
@@ -21,17 +23,23 @@ Requires Rust 1.85 or newer.
 cargo test
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
+cargo run -- --bind 127.0.0.1:61616
 ```
+
+The listener defaults to `127.0.0.1:61616`. It currently supports only the
+OpenWire negotiation and broker-identification handshake; a successful client
+connection does not mean queue operations are supported.
 
 ## Compatibility roadmap
 
-1. Define wire-format and broker-behavior compatibility tests against Apache
-   ActiveMQ Classic and its existing Java clients.
-2. Implement OpenWire negotiation and a minimal queue path, including
-   connection, producer, consumer, message, and acknowledgement commands.
-3. Add durable storage and recovery, then transactions and broker semantics.
-4. Add AMQP, MQTT, STOMP, and operational integrations as separately testable
-   protocol adapters.
+1. Establish a runnable TCP listener and OpenWire negotiation.
+2. Implement OpenWire connection/session, producer, consumer, message dispatch,
+   acknowledgement, and queue semantics with ActiveMQ Java-client tests.
+3. Add durable storage and recovery, then transactions, security, topics,
+   scheduling, and broker semantics.
+4. Add the remaining protocols and operational integrations as separately
+   testable adapters.
 
-The frame codec handles only OpenWire's length-prefixed frame boundary; it does
-not decode or encode OpenWire command payloads.
+The frame codec handles OpenWire's length-prefixed frame boundary. Command
+payload support is limited to the initial negotiation and broker-identification
+exchange.
