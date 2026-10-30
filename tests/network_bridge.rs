@@ -694,3 +694,511 @@ async fn remote_temporary_queue_is_proxied_and_cleaned_up_with_owner_lifecycle()
     local.stop();
     remote.stop();
 }
+
+async fn wait_for_network_consumer(
+    broker: &activemq_classic_rs::runtime::RunningBroker,
+    destination: &Destination,
+    present: bool,
+    context: &str,
+) {
+    let uri = destination.to_uri();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while broker
+            .core
+            .consumers()
+            .iter()
+            .any(|consumer| consumer.network && consumer.destination == uri)
+            != present
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{context}: network consumer for {uri} present != {present}"));
+}
+
+async fn expect_text(client: &mut OpenWireClient, text: &str) -> Message {
+    let (_, message, _) = client
+        .receive_message(Duration::from_secs(5))
+        .await
+        .unwrap()
+        .unwrap_or_else(|| panic!("expected {text}"));
+    assert_eq!(message.body, Body::Text(text.into()));
+    message
+}
+
+async fn expect_silence(client: &mut OpenWireClient, context: &str) {
+    if let Some((_, message, _)) = client
+        .receive_message(Duration::from_millis(700))
+        .await
+        .unwrap()
+    {
+        panic!("{context}: unexpected extra delivery {:?}", message.body);
+    }
+}
+
+#[tokio::test]
+async fn duplex_bridge_forwards_queue_and_topic_demand_in_both_directions_without_loops() {
+    let _guard = NETWORK_TEST_LOCK.lock().await;
+    let remote = activemq_classic_rs::runtime::start(broker_config())
+        .await
+        .unwrap();
+    let remote_address = remote.address("openwire").unwrap();
+    let mut local_config = broker_config();
+    local_config
+        .network_connectors
+        .push(NetworkConnectorConfig {
+            name: "duplex".into(),
+            uris: vec![format!("tcp://{remote_address}")],
+            dynamically_included_destinations: vec![
+                "queue://dx.>".into(),
+                "topic://dxnews.>".into(),
+            ],
+            duplex: true,
+            reconnect_delay_ms: 100,
+            ..NetworkConnectorConfig::default()
+        });
+    let local = activemq_classic_rs::runtime::start(local_config)
+        .await
+        .unwrap();
+    let mut remote_client = connected(remote_address).await;
+    let mut local_client = connected(local.address("openwire").unwrap()).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while remote.core.connections().is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("duplex bridge did not connect");
+
+    // Remote demand pulls local messages (forward direction).
+    let forward = Destination::queue("dx.forward");
+    remote_client
+        .create_consumer(&forward, 10, None)
+        .await
+        .unwrap();
+    wait_for_network_consumer(&local, &forward, true, "forward demand").await;
+    send(&mut local_client, &forward, "forward-1").await;
+    let forwarded = expect_text(&mut remote_client, "forward-1").await;
+    assert_eq!(forwarded.broker_path, vec![local.core.info().id]);
+
+    // Local demand is mirrored as a network consumer on the stock remote.
+    let reverse = Destination::queue("dx.reverse");
+    let reverse_consumer = local_client
+        .create_consumer(&reverse, 10, None)
+        .await
+        .unwrap();
+    wait_for_network_consumer(&remote, &reverse, true, "reverse demand").await;
+    send(&mut remote_client, &reverse, "reverse-1").await;
+    let reversed = expect_text(&mut local_client, "reverse-1").await;
+    assert_eq!(reversed.broker_path, vec![remote.core.info().id]);
+    assert_eq!(
+        remote
+            .core
+            .destinations()
+            .iter()
+            .filter(|d| d.destination == reverse)
+            .map(|d| d.pending)
+            .sum::<usize>(),
+        0
+    );
+    expect_silence(&mut local_client, "reverse queue").await;
+    expect_silence(&mut remote_client, "forward queue").await;
+
+    // Topic subscribers on both brokers each receive exactly one copy.
+    let topic = Destination::topic("dxnews.eu");
+    local_client
+        .create_consumer(&topic, 10, None)
+        .await
+        .unwrap();
+    remote_client
+        .create_consumer(&topic, 10, None)
+        .await
+        .unwrap();
+    wait_for_network_consumer(&local, &topic, true, "topic forward demand").await;
+    wait_for_network_consumer(&remote, &topic, true, "topic reverse demand").await;
+    send(&mut local_client, &topic, "from-local").await;
+    expect_text(&mut local_client, "from-local").await;
+    expect_text(&mut remote_client, "from-local").await;
+    send(&mut remote_client, &topic, "from-remote").await;
+    expect_text(&mut remote_client, "from-remote").await;
+    expect_text(&mut local_client, "from-remote").await;
+    expect_silence(&mut local_client, "topic loop on local").await;
+    expect_silence(&mut remote_client, "topic loop on remote").await;
+
+    // Removing the local consumer withdraws the mirrored remote consumer.
+    local_client
+        .remove_consumer(&reverse_consumer)
+        .await
+        .unwrap();
+    wait_for_network_consumer(&remote, &reverse, false, "reverse demand removal").await;
+    send(&mut remote_client, &reverse, "stays-remote").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        remote
+            .core
+            .destinations()
+            .iter()
+            .any(|d| d.destination == reverse && d.pending == 1),
+        "message without local demand must stay on the remote broker"
+    );
+
+    let core = local.core.clone();
+    local.stop();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while remote.core.connections().len() > 1 || core.consumers().iter().any(|c| c.network) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "stopped duplex bridge retained remote connections {:?}",
+            remote.core.connections()
+        )
+    });
+    remote.stop();
+}
+
+#[tokio::test]
+async fn duplex_reverse_demand_is_restored_after_remote_restart() {
+    let _guard = NETWORK_TEST_LOCK.lock().await;
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote_address = probe.local_addr().unwrap();
+    drop(probe);
+    let mut remote_config = broker_config();
+    remote_config.protocols.openwire.bind = remote_address.to_string();
+    let mut local_config = broker_config();
+    local_config
+        .network_connectors
+        .push(NetworkConnectorConfig {
+            name: "duplex-restart".into(),
+            uris: vec![format!("tcp://{remote_address}")],
+            dynamically_included_destinations: vec!["queue://dxr.>".into()],
+            duplex: true,
+            reconnect_delay_ms: 100,
+            ..NetworkConnectorConfig::default()
+        });
+    let local = activemq_classic_rs::runtime::start(local_config)
+        .await
+        .unwrap();
+    let destination = Destination::queue("dxr.jobs");
+    let mut local_client = connected(local.address("openwire").unwrap()).await;
+    local_client
+        .create_consumer(&destination, 10, None)
+        .await
+        .unwrap();
+    let first_remote = activemq_classic_rs::runtime::start(remote_config.clone())
+        .await
+        .unwrap();
+    wait_for_network_consumer(&first_remote, &destination, true, "initial duplex demand").await;
+    for connection in first_remote.core.connections() {
+        first_remote.core.close_connection(connection.id);
+    }
+    first_remote.stop();
+
+    let restarted = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match activemq_classic_rs::runtime::start(remote_config.clone()).await {
+                Ok(broker) => break broker,
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(error) => panic!("could not restart remote broker: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("remote listener did not release its address for restart");
+    wait_for_network_consumer(&restarted, &destination, true, "restored duplex demand").await;
+    let mut remote_client = connected(remote_address).await;
+    send(&mut remote_client, &destination, "after-duplex-restart").await;
+    expect_text(&mut local_client, "after-duplex-restart").await;
+    expect_silence(&mut local_client, "duplex restart duplicate").await;
+
+    local.stop();
+    restarted.stop();
+}
+
+#[tokio::test]
+async fn statically_included_advisory_topic_is_forwarded_with_its_data_structure() {
+    let _guard = NETWORK_TEST_LOCK.lock().await;
+    let remote = activemq_classic_rs::runtime::start(broker_config())
+        .await
+        .unwrap();
+    let remote_address = remote.address("openwire").unwrap();
+    let advisory_topic = Destination::topic("ActiveMQ.Advisory.Queue");
+    let mut local_config = broker_config();
+    local_config
+        .network_connectors
+        .push(NetworkConnectorConfig {
+            name: "advisories".into(),
+            uris: vec![format!("tcp://{remote_address}")],
+            static_included_destinations: vec![advisory_topic.to_uri()],
+            reconnect_delay_ms: 100,
+            ..NetworkConnectorConfig::default()
+        });
+    let local = activemq_classic_rs::runtime::start(local_config)
+        .await
+        .unwrap();
+    let mut remote_client = connected(remote_address).await;
+    remote_client
+        .create_consumer(&advisory_topic, 100, None)
+        .await
+        .unwrap();
+    wait_for_network_consumer(&local, &advisory_topic, true, "advisory bridge").await;
+
+    let created = Destination::queue("advisory.forwarded.queue");
+    let mut local_client = connected(local.address("openwire").unwrap()).await;
+    send(&mut local_client, &created, "creates-queue").await;
+    let local_id = local.core.info().id;
+    let forwarded = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let (_, message, _) = remote_client
+                .receive_message(Duration::from_secs(5))
+                .await
+                .unwrap()
+                .expect("forwarded advisory");
+            if matches!(
+                &message.advisory,
+                Some(activemq_classic_rs::core::AdvisoryData::DestinationAdded(d)) if *d == created
+            ) {
+                break message;
+            }
+        }
+    })
+    .await
+    .expect("destination advisory was not forwarded");
+    assert_eq!(forwarded.destination, advisory_topic);
+    assert_eq!(forwarded.broker_path, vec![local_id]);
+    assert!(
+        !remote
+            .core
+            .destinations()
+            .iter()
+            .any(|d| d.destination == created),
+        "only the advisory, not the queue, crosses the bridge"
+    );
+
+    local.stop();
+    remote.stop();
+}
+
+#[tokio::test]
+async fn consumer_advisory_forwarding_and_dynamic_advisory_includes_are_rejected() {
+    let _guard = NETWORK_TEST_LOCK.lock().await;
+    let remote = activemq_classic_rs::runtime::start(broker_config())
+        .await
+        .unwrap();
+    let remote_address = remote.address("openwire").unwrap();
+    let mut local_config = broker_config();
+    for (name, config) in [
+        (
+            "consumer-advisories",
+            NetworkConnectorConfig {
+                static_included_destinations: vec!["topic://ActiveMQ.Advisory.Consumer.>".into()],
+                ..NetworkConnectorConfig::default()
+            },
+        ),
+        (
+            "dynamic-advisories",
+            NetworkConnectorConfig {
+                dynamically_included_destinations: vec!["topic://ActiveMQ.Advisory.Queue".into()],
+                ..NetworkConnectorConfig::default()
+            },
+        ),
+    ] {
+        local_config
+            .network_connectors
+            .push(NetworkConnectorConfig {
+                name: name.into(),
+                uris: vec![format!("tcp://{remote_address}")],
+                reconnect_delay_ms: 100,
+                ..config
+            });
+    }
+    let local = activemq_classic_rs::runtime::start(local_config)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        remote.core.connections().is_empty(),
+        "rejected advisory connectors must not connect"
+    );
+    local.stop();
+    remote.stop();
+}
+
+async fn request(
+    client: &mut OpenWireClient,
+    destination: &Destination,
+    reply_to: &Destination,
+    text: &str,
+) {
+    let producer = client.create_producer(Some(destination)).await.unwrap();
+    let mut message = Message::text(destination.clone(), text);
+    message.reply_to = Some(reply_to.clone());
+    client.send(&producer, &message).await.unwrap();
+}
+
+async fn serve_one(service: &mut OpenWireClient, expected: &str, reply: &str) {
+    let (consumer, message, _) = service
+        .receive_message(Duration::from_secs(5))
+        .await
+        .unwrap()
+        .unwrap_or_else(|| panic!("service did not receive {expected}"));
+    assert_eq!(message.body, Body::Text(expected.into()));
+    service
+        .acknowledge(&consumer, &message.message_id)
+        .await
+        .unwrap();
+    let reply_to = message.reply_to.expect("request carries reply_to");
+    assert!(reply_to.is_temporary());
+    send(service, &reply_to, reply).await;
+}
+
+fn has_destination(
+    broker: &activemq_classic_rs::runtime::RunningBroker,
+    destination: &Destination,
+) -> bool {
+    broker
+        .core
+        .destinations()
+        .iter()
+        .any(|entry| entry.destination == *destination)
+}
+
+async fn wait_destination_gone(
+    broker: &activemq_classic_rs::runtime::RunningBroker,
+    destination: &Destination,
+    context: &str,
+) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while has_destination(broker, destination) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{context}: {destination} still exists"));
+}
+
+#[tokio::test]
+async fn duplex_request_reply_uses_temporary_queue_proxies_in_both_directions() {
+    let _guard = NETWORK_TEST_LOCK.lock().await;
+    let remote = activemq_classic_rs::runtime::start(broker_config())
+        .await
+        .unwrap();
+    let remote_address = remote.address("openwire").unwrap();
+    let mut local_config = broker_config();
+    local_config
+        .network_connectors
+        .push(NetworkConnectorConfig {
+            name: "duplex-temp".into(),
+            uris: vec![format!("tcp://{remote_address}")],
+            duplex: true,
+            reconnect_delay_ms: 100,
+            ..NetworkConnectorConfig::default()
+        });
+    let local = activemq_classic_rs::runtime::start(local_config)
+        .await
+        .unwrap();
+    let local_address = local.address("openwire").unwrap();
+    let pid = std::process::id();
+
+    // Local requester, remote service: the reply crosses the reverse
+    // (duplex) direction into a locally owned temporary queue.
+    let remote_service_queue = Destination::queue("rr.remote-service");
+    let mut remote_service = connected(remote_address).await;
+    remote_service
+        .create_consumer(&remote_service_queue, 10, None)
+        .await
+        .unwrap();
+    let mut local_requester = connected(local_address).await;
+    let local_reply =
+        create_temp_queue(&mut local_requester, &format!("ID:rr-local-{pid}:1:1")).await;
+    let local_reply_consumer = local_requester
+        .create_consumer(&local_reply, 10, None)
+        .await
+        .unwrap();
+    wait_for_network_consumer(&remote, &local_reply, true, "remote proxy for local temp").await;
+    wait_for_network_consumer(&local, &remote_service_queue, true, "remote service demand").await;
+    assert!(has_destination(&remote, &local_reply));
+    request(
+        &mut local_requester,
+        &remote_service_queue,
+        &local_reply,
+        "local-request",
+    )
+    .await;
+    serve_one(&mut remote_service, "local-request", "remote-reply").await;
+    let reply = expect_text(&mut local_requester, "remote-reply").await;
+    assert_eq!(reply.broker_path, vec![remote.core.info().id]);
+
+    // Remote requester, local service: the reply crosses the forward
+    // direction into a remotely owned temporary queue.
+    let local_service_queue = Destination::queue("rr.local-service");
+    let mut local_service = connected(local_address).await;
+    local_service
+        .create_consumer(&local_service_queue, 10, None)
+        .await
+        .unwrap();
+    let mut remote_requester = connected(remote_address).await;
+    let remote_reply =
+        create_temp_queue(&mut remote_requester, &format!("ID:rr-remote-{pid}:1:1")).await;
+    remote_requester
+        .create_consumer(&remote_reply, 10, None)
+        .await
+        .unwrap();
+    wait_for_network_consumer(&local, &remote_reply, true, "local proxy for remote temp").await;
+    wait_for_network_consumer(&remote, &local_service_queue, true, "local service demand").await;
+    request(
+        &mut remote_requester,
+        &local_service_queue,
+        &remote_reply,
+        "remote-request",
+    )
+    .await;
+    serve_one(&mut local_service, "remote-request", "local-reply").await;
+    let reply = expect_text(&mut remote_requester, "local-reply").await;
+    assert_eq!(reply.broker_path, vec![local.core.info().id]);
+    // A local proxy of a remote-owned temporary must never be mirrored back.
+    assert!(
+        !remote
+            .core
+            .consumers()
+            .iter()
+            .any(|consumer| consumer.network && consumer.destination == remote_reply.to_uri()),
+        "remote-owned temporary queue was echoed back as duplex demand"
+    );
+    expect_silence(&mut local_requester, "local requester duplicate").await;
+    expect_silence(&mut remote_requester, "remote requester duplicate").await;
+
+    // Owner lifecycle: deleting the local temporary removes the remote proxy;
+    // dropping the remote owner removes the local proxy.
+    local_requester
+        .remove_consumer(&local_reply_consumer)
+        .await
+        .unwrap();
+    local_requester
+        .remove_destination(&local_reply)
+        .await
+        .unwrap();
+    wait_destination_gone(
+        &remote,
+        &local_reply,
+        "remote proxy after local temp deletion",
+    )
+    .await;
+    wait_for_network_consumer(&remote, &local_reply, false, "remote proxy consumer").await;
+    drop(remote_requester);
+    wait_destination_gone(
+        &local,
+        &remote_reply,
+        "local proxy after remote owner closed",
+    )
+    .await;
+    assert!(has_destination(&local, &local_service_queue));
+
+    local.stop();
+    remote.stop();
+}

@@ -1,7 +1,11 @@
 //! OpenWire network connectors.
 //!
 //! Static destinations are always subscribed locally; dynamic destinations
-//! are subscribed only while the remote broker reports demand.
+//! are subscribed only while the remote broker reports demand. Duplex
+//! connectors additionally mirror local consumers as OpenWire network
+//! consumers on the remote broker. Forwarding is at-least-once: a message is
+//! acknowledged only after the receiving broker accepted it, so a crash in
+//! between can produce a duplicate.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
@@ -9,14 +13,19 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::mpsc;
+
 use crate::config::NetworkConnectorConfig;
 use crate::core::{
-    AckOp, Acks, Body, BrokerCore, ConsumerOptions, Destination, Event, Message, Value,
+    AckOp, Acks, AdvisoryData, BrokerCore, ConsumerOptions, Destination, Event, Message,
 };
-use crate::protocols::openwire::{OpenWireClient, OpenWireFrame};
+use crate::protocols::openwire::{self, OpenWireClient, OpenWireFrame};
 
 const DEFAULT_MAX_FRAME_SIZE: usize = 100 * 1024 * 1024;
 const CONSUMER_ADVISORY: &str = "ActiveMQ.Advisory.Consumer.>";
+/// Long idle waits end with a reconnect because a timed-out OpenWire read
+/// cannot be resumed safely.
+const DUPLEX_IDLE_RECONNECT: Duration = Duration::from_secs(24 * 60 * 60);
 
 type AdvisoryAck = Box<
     dyn for<'a> Fn(
@@ -33,13 +42,6 @@ pub fn start(
 ) -> tokio::task::JoinSet<()> {
     let mut tasks = tokio::task::JoinSet::new();
     for connector in connectors {
-        if connector.duplex {
-            tracing::error!(
-                name = %connector.name,
-                "duplex network connectors are unsupported until OpenWire network-consumer metadata can be sent"
-            );
-            continue;
-        }
         if connector.uris.is_empty() {
             tracing::error!(name = %connector.name, "network connector has no remote URIs");
             continue;
@@ -78,20 +80,8 @@ pub fn start(
             );
             continue;
         }
-        let advisory_probe = Destination::topic("ActiveMQ.Advisory.Consumer.Queue.network-probe");
-        let advisory_patterns = connector
-            .static_included_destinations
-            .iter()
-            .chain(&connector.dynamically_included_destinations)
-            .filter_map(|pattern| Destination::parse_uri(pattern))
-            .filter(|pattern| pattern.matches(&advisory_probe))
-            .collect::<Vec<_>>();
-        if !advisory_patterns.is_empty() {
-            tracing::error!(
-                name = %connector.name,
-                patterns = ?advisory_patterns,
-                "advisory forwarding is unsupported until OpenWire network messages encode advisory DataStructures"
-            );
+        if let Err(error) = validate_advisory_patterns(&connector) {
+            tracing::error!(name = %connector.name, %error, "invalid advisory forwarding configuration");
             continue;
         }
         let core = Arc::clone(&core);
@@ -161,10 +151,24 @@ async fn connect_and_run(
     core: Arc<BrokerCore>,
     config: &NetworkConnectorConfig,
 ) -> Result<(), String> {
-    let (address, mut advisory, acknowledge_advisory) = connect_remote(config).await?;
+    let (address, advisory, acknowledge_advisory) = connect_remote(config).await?;
+    let remote_broker_id = advisory.remote_broker_id().map(str::to_owned);
+    // The OpenWire client read path is not cancellation safe, so every remote
+    // reader runs in its own task and is only ever stopped by dropping its
+    // connection.
+    let (advisory_tx, mut remote_advisories) = mpsc::channel(256);
+    let _advisory_reader = AbortOnDrop(tokio::spawn(read_remote_advisories(
+        advisory,
+        acknowledge_advisory,
+        advisory_tx,
+    )));
 
     let broker_info = core.info();
     let local_broker_id = broker_info.id;
+    // Forwarding consumers never take messages that already passed through
+    // either end of this bridge, so duplex-received messages are not echoed.
+    let mut forward_path = vec![local_broker_id.clone()];
+    forward_path.extend(remote_broker_id.clone());
     let (connection, mut events) = core.connect_internal(&format!("network:{}", config.name));
     let _connection_guard = BridgeConnection {
         core: Arc::clone(&core),
@@ -173,26 +177,42 @@ async fn connect_and_run(
     let mut local_consumers = BTreeMap::<Destination, Vec<u64>>::new();
     let mut remote_demands = HashMap::<String, (Destination, Option<u64>)>::new();
     let mut temp_proxies = HashSet::<Destination>::new();
+    // Internal demand observer: local consumer advisories drive temporary
+    // proxy cleanup and duplex demand. It is never forwarded.
     let mut observer_options = ConsumerOptions::new(Destination::topic(CONSUMER_ADVISORY));
     observer_options.prefetch = 256;
     let observer = core
         .subscribe(connection, observer_options)
         .map_err(|error| error.to_string())?;
+    let (duplex_failures_tx, mut duplex_failures) = mpsc::unbounded_channel();
+    let mut duplex = config.duplex.then(|| DuplexBridges {
+        core: Arc::clone(&core),
+        connection,
+        address: address.clone(),
+        config: config.clone(),
+        local_broker_id: local_broker_id.clone(),
+        remote_broker_id: remote_broker_id.clone(),
+        failures: duplex_failures_tx,
+        consumers: HashMap::new(),
+        bridges: HashMap::new(),
+    });
 
     for item in &config.static_included_destinations {
         match parse_destination(item) {
             Ok(destination) if allowed(config, &destination) => {
-                if let Err(error) = subscribe_local(
+                subscribe_local(
                     &core,
                     connection,
                     config,
-                    &local_broker_id,
+                    &forward_path,
                     &destination,
                     &mut local_consumers,
                     false,
-                ) {
-                    core.disconnect(connection);
-                    return Err(error);
+                )?;
+                if let Some(duplex) = duplex.as_mut()
+                    && !destination.is_advisory()
+                {
+                    duplex.add_static(&destination);
                 }
             }
             Ok(_) => tracing::info!(
@@ -209,178 +229,191 @@ async fn connect_and_run(
         }
     }
 
+    if let Some(duplex) = duplex.as_mut() {
+        for consumer in core.consumers() {
+            if consumer.network || consumer.connection == connection {
+                continue;
+            }
+            if let Some(destination) = Destination::parse_uri(&consumer.destination) {
+                duplex.consumer_added(
+                    consumer.id,
+                    &destination,
+                    consumer.selector.as_deref(),
+                    false,
+                    &[],
+                );
+            }
+        }
+    }
+
     tracing::info!(
         name = %config.name,
         remote = %address,
+        duplex = config.duplex,
         "OpenWire network connector connected"
     );
 
-    let result = loop {
+    loop {
         tokio::select! {
-            frame = advisory.receive() => {
-                let frame = match frame {
-                    Ok(frame) => frame,
-                    Err(error) => break Err(error.to_string()),
+            action = remote_advisories.recv() => {
+                let action = match action {
+                    Some(Ok(action)) => action,
+                    Some(Err(error)) => return Err(error),
+                    None => return Err("remote advisory reader stopped".into()),
                 };
-                if frame.command_type == 31 {
-                    break Err("remote broker returned an advisory connection exception".into());
-                }
-                if frame.command_type != 21 {
-                    continue;
-                }
-                match decode_consumer_advisory(&frame) {
-                    Ok(Some(AdvisoryAction::Added {
+                match action {
+                    AdvisoryAction::Added {
                         external_id,
                         destination,
-                        message_id,
                         network,
                         broker_path,
-                    })) => {
-                        if let Err(error) = acknowledge_advisory(&mut advisory, &message_id).await {
-                            break Err(error);
-                        }
+                        ..
+                    } => {
                         if network || broker_path.contains(&local_broker_id) {
                             continue;
                         }
-                        if !destination.is_advisory()
-                            && allowed(config, &destination)
-                            && dynamically_included(config, &destination)
+                        if destination.is_advisory()
+                            || !allowed(config, &destination)
+                            || !dynamically_included(config, &destination)
                         {
-                            if destination.is_temporary()
-                                && let Err(error) = ensure_temp_proxy(
-                                    &core,
-                                    connection,
-                                    &destination,
-                                    &mut temp_proxies,
-                                )
-                            {
-                                tracing::warn!(name = %config.name, %destination, %error, "refusing unsafe temporary destination proxy");
-                                break Err(format!(
-                                    "temporary destination proxy conflict for {destination}: {error}"
-                                ));
-                            }
-                            let local_consumer = if config.conduit_subscriptions {
-                                None
-                            } else if remote_demands.contains_key(&external_id) {
-                                continue;
-                            } else {
-                                match subscribe_local(
-                                    &core,
-                                    connection,
-                                    config,
-                                    &local_broker_id,
-                                    &destination,
-                                    &mut local_consumers,
-                                    true,
-                                ) {
-                                    Ok(consumer) => Some(consumer),
-                                    Err(error) => break Err(error),
-                                }
-                            };
-                            remote_demands.insert(external_id, (destination.clone(), local_consumer));
-                            if config.conduit_subscriptions && let Err(error) = subscribe_local(
+                            continue;
+                        }
+                        if destination.is_temporary()
+                            && let Err(error) =
+                                ensure_temp_proxy(&core, connection, &destination, &mut temp_proxies)
+                        {
+                            tracing::warn!(name = %config.name, %destination, %error, "refusing unsafe temporary destination proxy");
+                            return Err(format!(
+                                "temporary destination proxy conflict for {destination}: {error}"
+                            ));
+                        }
+                        let local_consumer = if config.conduit_subscriptions {
+                            None
+                        } else if remote_demands.contains_key(&external_id) {
+                            continue;
+                        } else {
+                            Some(subscribe_local(
                                 &core,
                                 connection,
                                 config,
-                                &local_broker_id,
+                                &forward_path,
+                                &destination,
+                                &mut local_consumers,
+                                true,
+                            )?)
+                        };
+                        remote_demands.insert(external_id, (destination.clone(), local_consumer));
+                        if config.conduit_subscriptions {
+                            subscribe_local(
+                                &core,
+                                connection,
+                                config,
+                                &forward_path,
                                 &destination,
                                 &mut local_consumers,
                                 false,
-                            ) {
-                                break Err(error);
-                            }
+                            )?;
                         }
                     }
-                    Ok(Some(AdvisoryAction::Removed { external_id, message_id })) => {
-                        if let Err(error) = acknowledge_advisory(&mut advisory, &message_id).await {
-                            break Err(error);
-                        }
+                    AdvisoryAction::Removed { external_id, .. } => {
                         if let Some((destination, consumer)) = remote_demands.remove(&external_id) {
                             if let Some(consumer) = consumer {
                                 close_local_consumer(&core, &destination, consumer, &mut local_consumers);
                             }
                             let still_demanded = remote_demands.values().any(|(d, _)| d == &destination);
-                            if config.conduit_subscriptions && !still_demanded
-                                && !config.static_included_destinations.iter().filter_map(|s| Destination::parse_uri(s)).any(|d| d == destination)
+                            if config.conduit_subscriptions
+                                && !still_demanded
+                                && !config
+                                    .static_included_destinations
+                                    .iter()
+                                    .filter_map(|s| Destination::parse_uri(s))
+                                    .any(|d| d == destination)
                             {
                                 close_local(&core, destination.clone(), &mut local_consumers);
                             }
                             maybe_delete_temp_proxy(&core, connection, &destination, &remote_demands, &mut temp_proxies);
                         }
                     }
-                    Ok(None) => {
-                        if let Ok(dispatch) = parse_dispatch_prefix(&frame)
-                            && let Err(error) = acknowledge_advisory(&mut advisory, &dispatch.message_id).await
-                        {
-                            break Err(error);
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            name = %config.name,
-                            %error,
-                            "could not decode remote consumer advisory"
-                        );
-                        if let Ok(dispatch) = parse_dispatch_prefix(&frame)
-                            && let Err(error) = acknowledge_advisory(&mut advisory, &dispatch.message_id).await
-                        {
-                            break Err(error);
-                        }
-                    }
                 }
             }
+            Some(error) = duplex_failures.recv() => return Err(error),
             event = events.recv() => {
                 match event {
                     Some(Event::Deliver(delivery)) => {
-                        let mut message = (*delivery.message).clone();
-                        if delivery.consumer == observer {
-                            if let Some(crate::core::AdvisoryData::ConsumerRemoved {
-                                destination,
-                                ..
-                            }) = message.advisory.as_ref()
-                            {
-                                maybe_delete_temp_proxy(
-                                    &core,
-                                    connection,
-                                    destination,
-                                    &remote_demands,
-                                    &mut temp_proxies,
-                                );
-                            }
-                            if let Err(error) = core.ack(
+                        let ack = |core: &BrokerCore| {
+                            core.ack(
                                 connection,
                                 delivery.consumer,
                                 Acks::Deliveries(vec![delivery.delivery_id]),
                                 AckOp::Consumed,
                                 None,
-                            ) {
-                                break Err(error.to_string());
+                            )
+                            .map_err(|error| error.to_string())
+                        };
+                        if delivery.consumer == observer {
+                            match delivery.message.advisory.as_ref() {
+                                Some(AdvisoryData::ConsumerAdded {
+                                    consumer,
+                                    destination,
+                                    selector,
+                                    network,
+                                    broker_path,
+                                    ..
+                                }) => {
+                                    if let Some(duplex) = duplex.as_mut() {
+                                        duplex.consumer_added(
+                                            *consumer,
+                                            destination,
+                                            selector.as_deref(),
+                                            *network || temp_proxies.contains(destination),
+                                            broker_path,
+                                        );
+                                    }
+                                }
+                                Some(AdvisoryData::ConsumerRemoved {
+                                    consumer,
+                                    destination,
+                                    ..
+                                }) => {
+                                    maybe_delete_temp_proxy(
+                                        &core,
+                                        connection,
+                                        destination,
+                                        &remote_demands,
+                                        &mut temp_proxies,
+                                    );
+                                    if let Some(duplex) = duplex.as_mut() {
+                                        duplex.consumer_removed(*consumer);
+                                    }
+                                }
+                                _ => {}
                             }
+                            ack(&core)?;
                             continue;
                         }
-                        if message.advisory.is_some() {
-                            break Err(format!(
-                                "cannot forward advisory {}: OpenWire message encoding has no advisory DataStructure encoder",
-                                message.destination
-                            ));
+                        let mut message = (*delivery.message).clone();
+                        if (message.advisory.is_some() || message.destination.is_advisory())
+                            && !advisory_forwarding_allowed(config, &message.destination)
+                        {
+                            tracing::debug!(
+                                name = %config.name,
+                                destination = %message.destination,
+                                "advisory message not forwarded; advisory topics must be statically included by name"
+                            );
+                            ack(&core)?;
+                            continue;
                         }
                         if message.broker_path.contains(&local_broker_id) {
-                            if let Err(error) = core.ack(connection, delivery.consumer, Acks::Deliveries(vec![delivery.delivery_id]), AckOp::Consumed, None) {
-                                break Err(error.to_string());
-                            }
+                            ack(&core)?;
                             continue;
                         }
                         message.broker_path.push(local_broker_id.clone());
-                        match send_and_confirm(&address, config, &message).await {
-                            Ok(()) => {
-                                if let Err(error) = core.ack(connection, delivery.consumer, Acks::Deliveries(vec![delivery.delivery_id]), AckOp::Consumed, None) {
-                                    break Err(error.to_string());
-                                }
-                            }
-                            Err(error) => break Err(format!("remote send failed: {error}")),
-                        }
+                        send_and_confirm(&address, config, &message)
+                            .await
+                            .map_err(|error| format!("remote send failed: {error}"))?;
+                        ack(&core)?;
                     }
-                    Some(Event::ConnectionClosed { reason }) => break Err(reason),
+                    Some(Event::ConnectionClosed { reason }) => return Err(reason),
                     Some(Event::ConsumerClosed { consumer, .. }) => {
                         local_consumers.retain(|_, ids| {
                             ids.retain(|id| *id != consumer);
@@ -388,21 +421,224 @@ async fn connect_and_run(
                         });
                     }
                     Some(Event::BrowseDone { .. } | Event::PullEmpty { .. } | Event::Drained { .. }) => {}
-                    None => break Err("local broker connection closed".into()),
+                    None => return Err("local broker connection closed".into()),
                 }
             }
         }
-    };
-
-    core.disconnect(connection);
-    result
+    }
 }
 
-#[derive(Clone)]
-struct ProducerId {
-    connection: String,
-    session: i64,
-    value: i64,
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn read_remote_advisories(
+    mut advisory: OpenWireClient,
+    acknowledge: AdvisoryAck,
+    actions: mpsc::Sender<Result<AdvisoryAction, String>>,
+) {
+    let error = loop {
+        let frame = match advisory.receive().await {
+            Ok(frame) => frame,
+            Err(error) => break error.to_string(),
+        };
+        if frame.command_type == 31 {
+            break "remote broker returned an advisory connection exception".into();
+        }
+        if frame.command_type != 21 {
+            continue;
+        }
+        let decoded = decode_consumer_advisory(&frame);
+        // Consumer advisories are acknowledged once decoded; current demand is
+        // replayed by the remote broker whenever the bridge reconnects.
+        if let Ok(dispatch) = parse_dispatch_prefix(&frame)
+            && let Err(error) = acknowledge(&mut advisory, &dispatch.message_id).await
+        {
+            break error;
+        }
+        match decoded {
+            Ok(Some(action)) => {
+                if actions.send(Ok(action)).await.is_err() {
+                    return;
+                }
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(%error, "could not decode remote consumer advisory"),
+        }
+    };
+    let _ = actions.send(Err(error)).await;
+}
+
+/// Duplex demand: local consumers are mirrored as OpenWire network consumers
+/// on the remote broker so a stock peer pushes matching messages back over
+/// connections opened by this broker.
+struct DuplexBridges {
+    core: Arc<BrokerCore>,
+    connection: u64,
+    address: String,
+    config: NetworkConnectorConfig,
+    local_broker_id: String,
+    remote_broker_id: Option<String>,
+    failures: mpsc::UnboundedSender<String>,
+    consumers: HashMap<u64, String>,
+    bridges: HashMap<String, (AbortOnDrop, usize)>,
+}
+
+impl DuplexBridges {
+    fn add_static(&mut self, destination: &Destination) {
+        if destination.is_temporary() {
+            return;
+        }
+        self.retain(format!("static:{destination}"), destination, None);
+    }
+
+    /// `bridged` marks demand that must not be mirrored back: network
+    /// consumers and consumers of local proxies for remote-owned temporaries.
+    fn consumer_added(
+        &mut self,
+        consumer: u64,
+        destination: &Destination,
+        selector: Option<&str>,
+        bridged: bool,
+        broker_path: &[String],
+    ) {
+        if bridged
+            || broker_path.contains(&self.local_broker_id)
+            || destination.is_advisory()
+            || self.consumers.contains_key(&consumer)
+            || !allowed(&self.config, destination)
+            || !dynamically_included(&self.config, destination)
+        {
+            return;
+        }
+        // A temporary destination gets one remote proxy whatever the conduit
+        // setting: the proxy is owned by its bridge connection, so a second
+        // co-owning connection would delete it while still in use.
+        let (key, selector) = if destination.is_temporary() {
+            (format!("temporary:{destination}"), None)
+        } else if self.config.conduit_subscriptions {
+            (format!("destination:{destination}"), None)
+        } else {
+            (format!("consumer:{consumer}"), selector)
+        };
+        self.consumers.insert(consumer, key.clone());
+        self.retain(key, destination, selector);
+    }
+
+    fn consumer_removed(&mut self, consumer: u64) {
+        let Some(key) = self.consumers.remove(&consumer) else {
+            return;
+        };
+        if let Some((_, references)) = self.bridges.get_mut(&key) {
+            *references -= 1;
+            if *references == 0 {
+                // Closing the dedicated connection removes the remote network
+                // consumer; unacknowledged dispatches are redelivered remotely.
+                self.bridges.remove(&key);
+            }
+        }
+    }
+
+    fn retain(&mut self, key: String, destination: &Destination, selector: Option<&str>) {
+        if let Some((_, references)) = self.bridges.get_mut(&key) {
+            *references += 1;
+            return;
+        }
+        let task = tokio::spawn(run_duplex_consumer(
+            Arc::clone(&self.core),
+            self.connection,
+            self.address.clone(),
+            self.config.clone(),
+            self.local_broker_id.clone(),
+            self.remote_broker_id.clone(),
+            destination.clone(),
+            selector.map(str::to_owned),
+            self.failures.clone(),
+        ));
+        self.bridges.insert(key, (AbortOnDrop(task), 1));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_duplex_consumer(
+    core: Arc<BrokerCore>,
+    connection: u64,
+    address: String,
+    config: NetworkConnectorConfig,
+    local_broker_id: String,
+    remote_broker_id: Option<String>,
+    destination: Destination,
+    selector: Option<String>,
+    failures: mpsc::UnboundedSender<String>,
+) {
+    let result = async {
+        let mut client = OpenWireClient::connect_client(
+            address.as_str(),
+            DEFAULT_MAX_FRAME_SIZE,
+            None,
+            config.username.as_deref(),
+            config.password.as_deref(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        if destination.is_temporary() {
+            // Equivalent to Classic bridgeTempDestinations: the remote proxy is
+            // owned by this dedicated connection and disappears with it, i.e.
+            // when the last local consumer of the temporary destination goes.
+            if let Err(error) = client.add_destination(&destination).await {
+                tracing::warn!(
+                    name = %config.name,
+                    %destination,
+                    %error,
+                    "remote broker refused temporary destination proxy; duplex demand not forwarded"
+                );
+                return Ok(());
+            }
+        }
+        client
+            .create_network_consumer(
+                &destination,
+                config.prefetch.max(1),
+                selector.as_deref(),
+                std::slice::from_ref(&local_broker_id),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        tracing::debug!(name = %config.name, %destination, "duplex network consumer registered remotely");
+        loop {
+            let Some((consumer, mut message, _)) = client
+                .receive_message(DUPLEX_IDLE_RECONNECT)
+                .await
+                .map_err(|error| error.to_string())?
+            else {
+                return Err::<(), String>("duplex consumer idle; reconnecting".into());
+            };
+            let message_id = message.message_id.clone();
+            if !message.broker_path.contains(&local_broker_id) {
+                // Like Classic, record the broker the message was bridged
+                // from; without a BrokerInfo id fall back to the local id.
+                message
+                    .broker_path
+                    .push(remote_broker_id.clone().unwrap_or_else(|| local_broker_id.clone()));
+                // At-least-once: the remote dispatch is acknowledged only
+                // after the local broker accepted the message.
+                core.send(connection, message, None)
+                    .map_err(|error| format!("local send failed: {error}"))?;
+            }
+            client
+                .acknowledge(&consumer, &message_id)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    .await;
+    if let Err(error) = result {
+        let _ = failures.send(format!("duplex demand for {destination} failed: {error}"));
+    }
 }
 
 async fn send_and_confirm(
@@ -423,13 +659,10 @@ async fn send_and_confirm(
         .create_producer(None)
         .await
         .map_err(|error| error.to_string())?;
-    let producer = ProducerId {
-        connection: producer.connection.clone(),
-        session: producer.session,
-        value: producer.value,
-    };
     let command_id = client.next_command_id();
-    let frame = encode_message(command_id, &producer, message)?;
+    let mut frame = openwire::encode_client_message(&producer, message, command_id);
+    // Loose-encoded command header: CommandId (i32) then responseRequired.
+    frame.payload[4] = 1;
     client
         .send_command(&frame)
         .await
@@ -452,257 +685,6 @@ async fn send_and_confirm(
             ),
         }
     }
-}
-
-fn encode_message(
-    command_id: i32,
-    producer: &ProducerId,
-    message: &Message,
-) -> Result<OpenWireFrame, String> {
-    let mut payload = command_id.to_be_bytes().to_vec();
-    payload.push(1);
-    append_id(&mut payload, 123, producer)?;
-    append_destination(&mut payload, &message.destination)?;
-    payload.push(0); // transaction
-    append_optional_destination(&mut payload, message.original_destination.as_ref())?;
-    payload.push(1);
-    payload.push(110); // MessageId
-    append_string(&mut payload, Some(&message.message_id))?;
-    append_id(&mut payload, 123, producer)?;
-    payload.extend_from_slice(&0i64.to_be_bytes());
-    payload.extend_from_slice(&0i64.to_be_bytes());
-    payload.push(0);
-    append_string(&mut payload, message.group_id.as_deref())?;
-    payload.extend_from_slice(&message.group_sequence.to_be_bytes());
-    append_string(&mut payload, message.correlation_id.as_deref())?;
-    payload.push(u8::from(message.persistent));
-    payload.extend_from_slice(&message.expiration.to_be_bytes());
-    payload.push(message.priority);
-    append_optional_destination(&mut payload, message.reply_to.as_ref())?;
-    payload.extend_from_slice(&message.timestamp.to_be_bytes());
-    append_string(&mut payload, message.message_type.as_deref())?;
-
-    let body = encode_body(&message.body)?;
-    write_bytes(&mut payload, Some(&body))?;
-    let properties = encode_properties(&message.properties, 0)?;
-    write_bytes(
-        &mut payload,
-        (!message.properties.is_empty()).then_some(properties.as_slice()),
-    )?;
-    payload.extend_from_slice(&[0, 0, 0]); // advisory, compression, and optional property flags
-    payload.extend_from_slice(&0i32.to_be_bytes());
-    if message.broker_path.is_empty() {
-        payload.push(0);
-    } else {
-        payload.push(1);
-        let count = u16::try_from(message.broker_path.len())
-            .map_err(|_| "broker path exceeds OpenWire limit")?;
-        payload.extend_from_slice(&count.to_be_bytes());
-        for broker in &message.broker_path {
-            append_nested_string(&mut payload, 124, Some(broker))?;
-        }
-    }
-    payload.extend_from_slice(&0i64.to_be_bytes());
-    append_string(&mut payload, message.user_id.as_deref())?;
-    payload.extend_from_slice(&[0, 0, 0]);
-    payload.extend_from_slice(&0i64.to_be_bytes());
-    payload.extend_from_slice(&message.broker_in_time.to_be_bytes());
-    payload.push(0);
-    let command_type = match message.body {
-        Body::Empty => 23,
-        Body::Bytes(_) => 24,
-        Body::Map(_) => 25,
-        Body::Object(_) => 26,
-        Body::Stream(_) => 27,
-        Body::Text(_) => 28,
-    };
-    Ok(OpenWireFrame {
-        command_type,
-        payload,
-    })
-}
-
-fn append_id(out: &mut Vec<u8>, kind: u8, id: &ProducerId) -> Result<(), String> {
-    out.extend_from_slice(&[1, kind]);
-    append_string(out, Some(&id.connection))?;
-    if kind == 123 {
-        out.extend_from_slice(&id.value.to_be_bytes());
-        out.extend_from_slice(&id.session.to_be_bytes());
-    }
-    Ok(())
-}
-
-fn append_destination(out: &mut Vec<u8>, destination: &Destination) -> Result<(), String> {
-    let kind = match destination.kind {
-        crate::core::DestinationKind::Queue => 100,
-        crate::core::DestinationKind::Topic => 101,
-        crate::core::DestinationKind::TempQueue => 102,
-        crate::core::DestinationKind::TempTopic => 103,
-    };
-    out.extend_from_slice(&[1, kind]);
-    append_string(out, Some(&destination.name))
-}
-
-fn append_optional_destination(
-    out: &mut Vec<u8>,
-    destination: Option<&Destination>,
-) -> Result<(), String> {
-    if let Some(destination) = destination {
-        append_destination(out, destination)
-    } else {
-        out.push(0);
-        Ok(())
-    }
-}
-
-fn append_nested_string(out: &mut Vec<u8>, kind: u8, value: Option<&str>) -> Result<(), String> {
-    out.extend_from_slice(&[1, kind]);
-    append_string(out, value)
-}
-
-fn append_string(out: &mut Vec<u8>, value: Option<&str>) -> Result<(), String> {
-    if let Some(value) = value {
-        out.push(1);
-        append_java_utf(out, value)
-    } else {
-        out.push(0);
-        Ok(())
-    }
-}
-
-fn append_java_utf(out: &mut Vec<u8>, value: &str) -> Result<(), String> {
-    let bytes = encode_modified_utf8(value);
-    let len = u16::try_from(bytes.len()).map_err(|_| "OpenWire string exceeds 65535 bytes")?;
-    out.extend_from_slice(&len.to_be_bytes());
-    out.extend_from_slice(&bytes);
-    Ok(())
-}
-
-fn encode_modified_utf8(value: &str) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    for unit in value.encode_utf16() {
-        match unit {
-            1..=0x7f => bytes.push(unit as u8),
-            0..=0x7ff => {
-                bytes.push((0xc0 | ((unit >> 6) & 0x1f)) as u8);
-                bytes.push((0x80 | (unit & 0x3f)) as u8);
-            }
-            _ => {
-                bytes.push((0xe0 | ((unit >> 12) & 0x0f)) as u8);
-                bytes.push((0x80 | ((unit >> 6) & 0x3f)) as u8);
-                bytes.push((0x80 | (unit & 0x3f)) as u8);
-            }
-        }
-    }
-    bytes
-}
-
-fn write_bytes(out: &mut Vec<u8>, bytes: Option<&[u8]>) -> Result<(), String> {
-    if let Some(bytes) = bytes {
-        let len = i32::try_from(bytes.len()).map_err(|_| "OpenWire byte sequence too large")?;
-        out.push(1);
-        out.extend_from_slice(&len.to_be_bytes());
-        out.extend_from_slice(bytes);
-    } else {
-        out.push(0);
-    }
-    Ok(())
-}
-
-fn encode_body(body: &Body) -> Result<Vec<u8>, String> {
-    match body {
-        Body::Empty => Ok(Vec::new()),
-        Body::Text(text) => {
-            let bytes = encode_modified_utf8(text);
-            let len = i32::try_from(bytes.len()).map_err(|_| "text body too large")?;
-            let mut out = len.to_be_bytes().to_vec();
-            out.extend_from_slice(&bytes);
-            Ok(out)
-        }
-        Body::Bytes(bytes) | Body::Object(bytes) => Ok(bytes.clone()),
-        Body::Map(map) => encode_properties(map, 0),
-        Body::Stream(values) => {
-            let mut out = Vec::new();
-            for value in values {
-                encode_value(&mut out, value, 0)?;
-            }
-            Ok(out)
-        }
-    }
-}
-
-fn encode_properties(
-    properties: &std::collections::BTreeMap<String, Value>,
-    depth: usize,
-) -> Result<Vec<u8>, String> {
-    if depth > 16 {
-        return Err("OpenWire property nesting exceeds limit".into());
-    }
-    let count = i32::try_from(properties.len()).map_err(|_| "too many OpenWire properties")?;
-    let mut out = count.to_be_bytes().to_vec();
-    for (key, value) in properties {
-        append_java_utf(&mut out, key)?;
-        encode_value(&mut out, value, depth + 1)?;
-    }
-    Ok(out)
-}
-
-fn encode_value(out: &mut Vec<u8>, value: &Value, depth: usize) -> Result<(), String> {
-    if depth > 16 {
-        return Err("OpenWire property nesting exceeds limit".into());
-    }
-    match value {
-        Value::Null => out.push(0),
-        Value::Bool(value) => out.extend_from_slice(&[1, u8::from(*value)]),
-        Value::Byte(value) => out.extend_from_slice(&[2, *value as u8]),
-        Value::Char(value) => {
-            out.push(3);
-            out.extend_from_slice(&value.to_be_bytes());
-        }
-        Value::Short(value) => {
-            out.push(4);
-            out.extend_from_slice(&value.to_be_bytes());
-        }
-        Value::Int(value) => {
-            out.push(5);
-            out.extend_from_slice(&value.to_be_bytes());
-        }
-        Value::Long(value) => {
-            out.push(6);
-            out.extend_from_slice(&value.to_be_bytes());
-        }
-        Value::Double(value) => {
-            out.push(7);
-            out.extend_from_slice(&value.to_bits().to_be_bytes());
-        }
-        Value::Float(value) => {
-            out.push(8);
-            out.extend_from_slice(&value.to_bits().to_be_bytes());
-        }
-        Value::String(value) => {
-            out.push(9);
-            append_java_utf(out, value)?;
-        }
-        Value::Bytes(value) => {
-            out.push(10);
-            let len = i32::try_from(value.len()).map_err(|_| "OpenWire byte property too large")?;
-            out.extend_from_slice(&len.to_be_bytes());
-            out.extend_from_slice(value);
-        }
-        Value::Map(value) => {
-            out.push(11);
-            out.extend_from_slice(&encode_properties(value, depth + 1)?);
-        }
-        Value::List(values) => {
-            out.push(12);
-            let count = i32::try_from(values.len()).map_err(|_| "OpenWire list too large")?;
-            out.extend_from_slice(&count.to_be_bytes());
-            for value in values {
-                encode_value(out, value, depth + 1)?;
-            }
-        }
-    }
-    Ok(())
 }
 
 fn decode_remote_exception(payload: &[u8]) -> String {
@@ -770,7 +752,7 @@ fn subscribe_local(
     core: &BrokerCore,
     connection: u64,
     config: &NetworkConnectorConfig,
-    local_broker_id: &str,
+    broker_path: &[String],
     destination: &Destination,
     consumers: &mut BTreeMap<Destination, Vec<u64>>,
     force_new: bool,
@@ -782,7 +764,7 @@ fn subscribe_local(
     options.prefetch = config.prefetch.max(1);
     options.network = true;
     options.network_ttl = Some(config.network_ttl);
-    options.broker_path = vec![local_broker_id.to_owned()];
+    options.broker_path = broker_path.to_vec();
     options.external_id = Some(format!("network:{}", config.name));
     let consumer = core
         .subscribe(connection, options)
@@ -878,6 +860,50 @@ fn allowed(config: &NetworkConnectorConfig, destination: &Destination) -> bool {
     })
 }
 
+/// Advisory topics are bridged only when named by an explicit static
+/// `topic://ActiveMQ.Advisory...` include, mirroring Classic's default of not
+/// forwarding advisories through generic wildcards.
+fn advisory_forwarding_allowed(config: &NetworkConnectorConfig, destination: &Destination) -> bool {
+    destination.is_advisory()
+        && allowed(config, destination)
+        && config
+            .static_included_destinations
+            .iter()
+            .filter_map(|pattern| Destination::parse_uri(pattern))
+            .any(|pattern| pattern.is_advisory() && pattern.matches(destination))
+}
+
+fn validate_advisory_patterns(config: &NetworkConnectorConfig) -> Result<(), String> {
+    let demand_probes = [
+        Destination::queue("network-probe").consumer_advisory_topic(),
+        Destination::topic("network-probe").consumer_advisory_topic(),
+        Destination::temp_queue("network-probe").consumer_advisory_topic(),
+        Destination::temp_topic("network-probe").consumer_advisory_topic(),
+    ];
+    for pattern in &config.dynamically_included_destinations {
+        if Destination::parse_uri(pattern).is_some_and(|pattern| pattern.is_advisory()) {
+            return Err(format!(
+                "{pattern}: advisory consumers emit no consumer advisories, so dynamic advisory demand cannot be observed; use static_included_destinations"
+            ));
+        }
+    }
+    for pattern in &config.static_included_destinations {
+        let Some(destination) = Destination::parse_uri(pattern) else {
+            continue;
+        };
+        if destination.is_advisory() && !destination.is_topic() {
+            return Err(format!("{pattern}: advisory destinations are topics"));
+        }
+        if destination.is_advisory() && demand_probes.iter().any(|probe| destination.matches(probe))
+        {
+            return Err(format!(
+                "{pattern}: consumer advisories are the network demand channel; forwarding them would create phantom demand on peers"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn dynamically_included(config: &NetworkConnectorConfig, destination: &Destination) -> bool {
     config.dynamically_included_destinations.is_empty()
         || config
@@ -892,13 +918,11 @@ enum AdvisoryAction {
     Added {
         external_id: String,
         destination: Destination,
-        message_id: String,
         network: bool,
         broker_path: Vec<String>,
     },
     Removed {
         external_id: String,
-        message_id: String,
     },
 }
 
@@ -915,7 +939,7 @@ struct DispatchPrefix {
 }
 
 fn decode_consumer_advisory(frame: &OpenWireFrame) -> Result<Option<AdvisoryAction>, String> {
-    let dispatch = parse_dispatch_prefix(frame)?;
+    parse_dispatch_prefix(frame)?;
     let Some(data) = parse_advisory_data(frame)? else {
         return Ok(None);
     };
@@ -923,13 +947,11 @@ fn decode_consumer_advisory(frame: &OpenWireFrame) -> Result<Option<AdvisoryActi
         5 => Ok(Some(AdvisoryAction::Added {
             external_id: data.external_id,
             destination: data.destination,
-            message_id: dispatch.message_id,
             network: data.network,
             broker_path: data.broker_path,
         })),
         12 => Ok(Some(AdvisoryAction::Removed {
             external_id: data.external_id,
-            message_id: dispatch.message_id,
         })),
         _ => Ok(None),
     }
