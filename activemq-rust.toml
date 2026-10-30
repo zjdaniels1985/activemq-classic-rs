@@ -1,0 +1,98 @@
+# activemq-classic-rs configuration. Every section and key is optional.
+
+[broker]
+name = "activemq-classic-rs"
+max_frame_size = 104857600
+
+# Destination policy (ActiveMQ <policyEntry> / redelivery / DLQ settings).
+[policy]
+max_redeliveries = 6
+dead_letter_queue = "ActiveMQ.DLQ"
+individual_dead_letter = false        # true => DLQ.<destination>
+individual_dead_letter_prefix = "DLQ."
+dead_letter_expired = true
+max_queue_messages = 0                # 0 = unlimited
+advisory_support = true
+scheduler_support = true              # AMQ_SCHEDULED_DELAY / PERIOD / REPEAT / CRON
+virtual_topics = true
+virtual_topic_prefix = "VirtualTopic."
+virtual_topic_consumer_prefix = "Consumer."
+auto_create_destinations = true
+expire_check_interval_ms = 1000
+always_retroactive = false
+# Volatile per-topic history, replayed for consumer.retroactive=true.
+# [policy.subscription_recovery]
+# type = "fixed_count"                # "none" (default), "last_image", "fixed_count"
+# maximum_size = 100                  # required only for fixed_count
+
+# Simple authentication + authorization plugins.
+[security]
+enabled = false
+allow_anonymous = false
+# anonymous_user = "anonymous"
+# anonymous_groups = ["anonymous"]
+#
+# [[security.users]]
+# username = "admin"
+# password_sha256 = "8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918" # "admin"
+# groups = ["admins"]
+#
+# [[security.authorization]]
+# destination = "queue://>"           # queue://, topic://, temp-queue:// or temp-topic:// pattern
+# read = ["admins"]
+# write = ["admins"]
+# admin = ["admins"]
+
+# Protocol listeners. Each accepts `enabled`, `bind`, `max_connections` and an
+# `options` table for protocol specific settings, so future transports can be
+# added as new [protocols.<name>] sections.
+[protocols.openwire]
+enabled = true
+bind = "127.0.0.1:61616"
+
+[protocols.stomp]
+enabled = true
+bind = "127.0.0.1:61613"
+
+[protocols.amqp]
+enabled = true
+bind = "127.0.0.1:5672"
+
+[protocols.mqtt]
+enabled = true
+bind = "127.0.0.1:1883"
+
+[persistence]
+backend = "sled"                      # "sled" or "memory"
+path = "./data/sled"
+
+[persistence.group_commit]
+queue_capacity = 64
+max_batch_operations = 64
+max_batch_bytes = 4194304
+max_pending_bytes = 67108864          # backpressure; one oversized atomic operation may run alone
+max_delay_us = 0                      # opportunistic batching; >0 allows a bounded batching wait
+
+[web_console]
+enabled = true
+bind = "127.0.0.1:8161"
+# Required when binding the console to a non-loopback address.
+# admin_token = "set-a-long-random-secret"
+
+[logging]
+level = "info"                        # overridden by RUST_LOG
+format = "text"                       # "text" or "json"
+# file = "./data/broker.log"
+ansi = true
+
+# Network of brokers (static OpenWire bridges).
+# [[network_connectors]]
+# name = "to-east"
+# uris = ["tcp://east.example.com:61616"]
+# duplex = false
+# network_ttl = 1
+# dynamically_included_destinations = ["queue://>", "topic://>"]
+# excluded_destinations = []
+# static_included_destinations = []
+# conduit_subscriptions = true
+# reconnect_delay_ms = 1000
