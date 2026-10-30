@@ -1,15 +1,19 @@
 //! Minimal bidirectional OpenWire client for tests and network bridge reuse.
 use std::collections::{HashMap, VecDeque};
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use flate2::read::ZlibDecoder;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpStream, ToSocketAddrs};
 use tokio::time;
 
 use super::codec::{self, OpenWireFrame, WireDestination, WireId};
-use crate::core::{Body, Destination, Message};
+use crate::core::{Body, Destination, DestinationKind, Message};
+
+static NEXT_CLIENT_INSTANCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
 pub struct OpenWireError(pub String);
@@ -26,14 +30,17 @@ impl From<io::Error> for OpenWireError {
 }
 
 pub struct OpenWireClient {
-    stream: TcpStream,
+    reader: OwnedReadHalf,
+    writer: OwnedWriteHalf,
     max_frame_size: usize,
     next_command_id: i32,
     next_sequence: i64,
+    remote_broker_id: Option<String>,
     connection_id: Option<WireId>,
     session_id: Option<WireId>,
     consumer_destinations: HashMap<WireId, WireDestination>,
     pending: VecDeque<OpenWireFrame>,
+    keepalive: time::Interval,
 }
 
 impl OpenWireClient {
@@ -56,16 +63,28 @@ impl OpenWireClient {
         if broker.command_type != 2 {
             return Err(OpenWireError("broker did not send BrokerInfo".into()));
         }
+        let remote_broker_id = codec::decode_broker_info(&broker)?;
+        let (reader, writer) = stream.into_split();
         Ok(Self {
-            stream,
+            reader,
+            writer,
             max_frame_size,
             next_command_id: 1,
             next_sequence: 1,
+            remote_broker_id,
             connection_id: None,
             session_id: None,
             consumer_destinations: HashMap::new(),
             pending: VecDeque::new(),
+            keepalive: time::interval_at(
+                time::Instant::now() + Duration::from_secs(10),
+                Duration::from_secs(10),
+            ),
         })
+    }
+
+    pub fn remote_broker_id(&self) -> Option<&str> {
+        self.remote_broker_id.as_deref()
     }
 
     /// Negotiates a connection and creates its default session.
@@ -77,30 +96,42 @@ impl OpenWireClient {
         password: Option<&str>,
     ) -> Result<Self, OpenWireError> {
         let mut client = Self::connect(address, max_frame_size).await?;
+        client.start_client(client_id, username, password).await?;
+        Ok(client)
+    }
+
+    async fn start_client(
+        &mut self,
+        client_id: Option<&str>,
+        username: Option<&str>,
+        password: Option<&str>,
+    ) -> Result<(), OpenWireError> {
         let connection = WireId {
-            connection: format!("ID:rust-{}", std::process::id()),
+            connection: format!(
+                "ID:rust-{}-{}",
+                std::process::id(),
+                NEXT_CLIENT_INSTANCE.fetch_add(1, Ordering::Relaxed)
+            ),
             session: 0,
             value: 0,
         };
-        let id = client.next_command_id();
-        client
-            .send_and_wait(
-                codec::client_connection_info(id, &connection, client_id, username, password),
-                id,
-            )
-            .await?;
+        let id = self.next_command_id();
+        self.send_and_wait(
+            codec::client_connection_info(id, &connection, client_id, username, password),
+            id,
+        )
+        .await?;
         let session = WireId {
             connection: connection.connection.clone(),
             session: 1,
             value: 0,
         };
-        let id = client.next_command_id();
-        client
-            .send_and_wait(codec::client_session_info(id, &session), id)
+        let id = self.next_command_id();
+        self.send_and_wait(codec::client_session_info(id, &session), id)
             .await?;
-        client.connection_id = Some(connection);
-        client.session_id = Some(session);
-        Ok(client)
+        self.connection_id = Some(connection);
+        self.session_id = Some(session);
+        Ok(())
     }
 
     pub async fn create_consumer(
@@ -108,6 +139,29 @@ impl OpenWireClient {
         destination: &Destination,
         prefetch: u32,
         selector: Option<&str>,
+    ) -> Result<WireId, OpenWireError> {
+        self.create_consumer_options(destination, prefetch, selector, false, &[])
+            .await
+    }
+
+    pub async fn create_network_consumer(
+        &mut self,
+        destination: &Destination,
+        prefetch: u32,
+        selector: Option<&str>,
+        broker_path: &[String],
+    ) -> Result<WireId, OpenWireError> {
+        self.create_consumer_options(destination, prefetch, selector, true, broker_path)
+            .await
+    }
+
+    async fn create_consumer_options(
+        &mut self,
+        destination: &Destination,
+        prefetch: u32,
+        selector: Option<&str>,
+        network: bool,
+        broker_path: &[String],
     ) -> Result<WireId, OpenWireError> {
         let session = self
             .session_id
@@ -122,13 +176,97 @@ impl OpenWireClient {
         let cmd = self.next_command_id();
         let wire_destination = codec::wire_destination(destination);
         self.send_and_wait(
-            codec::client_consumer_info(cmd, &id, &wire_destination, prefetch, selector),
+            codec::client_consumer_info_options(
+                cmd,
+                &id,
+                &wire_destination,
+                prefetch,
+                selector,
+                network,
+                broker_path,
+            ),
             cmd,
         )
         .await?;
         self.consumer_destinations
             .insert(id.clone(), wire_destination);
         Ok(id)
+    }
+
+    pub async fn add_temporary_destination(
+        &mut self,
+        kind: DestinationKind,
+    ) -> Result<Destination, OpenWireError> {
+        let connection = self
+            .connection_id
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| OpenWireError("client connection is not started".into()))?;
+        let destination = Destination::new(
+            kind,
+            format!("temp-rust-{}-{}", std::process::id(), self.next_sequence),
+        );
+        self.next_sequence += 1;
+        let id = self.next_command_id();
+        let wire_destination = codec::wire_destination(&destination);
+        self.send_and_wait(
+            codec::client_destination_info(id, &connection, &wire_destination, 0),
+            id,
+        )
+        .await?;
+        Ok(destination)
+    }
+
+    pub async fn add_destination(
+        &mut self,
+        destination: &Destination,
+    ) -> Result<(), OpenWireError> {
+        let connection = self
+            .connection_id
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| OpenWireError("client connection is not started".into()))?;
+        let id = self.next_command_id();
+        self.send_and_wait(
+            codec::client_destination_info(
+                id,
+                &connection,
+                &codec::wire_destination(destination),
+                0,
+            ),
+            id,
+        )
+        .await
+    }
+
+    pub async fn remove_destination(
+        &mut self,
+        destination: &Destination,
+    ) -> Result<(), OpenWireError> {
+        let connection = self
+            .connection_id
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| OpenWireError("client connection is not started".into()))?;
+        let id = self.next_command_id();
+        self.send_and_wait(
+            codec::client_destination_info(
+                id,
+                &connection,
+                &codec::wire_destination(destination),
+                1,
+            ),
+            id,
+        )
+        .await
+    }
+
+    pub async fn remove_consumer(&mut self, consumer: &WireId) -> Result<(), OpenWireError> {
+        let id = self.next_command_id();
+        self.send_and_wait(codec::client_remove_info(id, consumer), id)
+            .await?;
+        self.consumer_destinations.remove(consumer);
+        Ok(())
     }
 
     pub async fn create_producer(
@@ -170,7 +308,17 @@ impl OpenWireClient {
             let frame = if let Some(frame) = self.pending.pop_front() {
                 frame
             } else {
-                read_frame(&mut self.stream, self.max_frame_size).await?
+                tokio::select! {
+                    result = read_frame(&mut self.reader, self.max_frame_size) => result?,
+                    _ = self.keepalive.tick() => {
+                        let keepalive = OpenWireFrame {
+                            command_type: 10,
+                            payload: codec::base(0, false),
+                        };
+                        write_frame(&mut self.writer, &keepalive, self.max_frame_size).await?;
+                        continue;
+                    }
+                }
             };
             if frame.command_type == 10 {
                 continue;
@@ -247,6 +395,7 @@ impl OpenWireClient {
         message.group_sequence = wire.group_sequence;
         message.message_type = wire.message_type;
         message.broker_path = wire.broker_path;
+        message.advisory = wire.advisory;
         message.properties = codec::unmarshal_properties(&wire.properties)?;
         Ok(Some((consumer, message, redelivery)))
     }
@@ -267,7 +416,7 @@ impl OpenWireClient {
     }
 
     pub async fn send_command(&mut self, frame: &OpenWireFrame) -> Result<(), OpenWireError> {
-        write_frame(&mut self.stream, frame, self.max_frame_size).await?;
+        write_frame(&mut self.writer, frame, self.max_frame_size).await?;
         Ok(())
     }
     pub fn next_command_id(&mut self) -> i32 {
@@ -275,8 +424,8 @@ impl OpenWireClient {
         self.next_command_id = self.next_command_id.wrapping_add(1);
         id
     }
-    pub fn into_stream(self) -> TcpStream {
-        self.stream
+    pub fn into_parts(self) -> (OwnedReadHalf, OwnedWriteHalf) {
+        (self.reader, self.writer)
     }
 
     async fn send_and_wait(
@@ -286,7 +435,7 @@ impl OpenWireClient {
     ) -> Result<(), OpenWireError> {
         self.send_command(&frame).await?;
         loop {
-            let frame = read_frame(&mut self.stream, self.max_frame_size).await?;
+            let frame = read_frame(&mut self.reader, self.max_frame_size).await?;
             if frame.command_type == 10 {
                 continue;
             }
@@ -321,12 +470,19 @@ fn decode_exception(frame: &OpenWireFrame) -> String {
         "OpenWire broker exception".into()
     }
 }
-async fn write_frame(stream: &mut TcpStream, frame: &OpenWireFrame, max: usize) -> io::Result<()> {
+async fn write_frame(
+    stream: &mut (impl AsyncWrite + Unpin),
+    frame: &OpenWireFrame,
+    max: usize,
+) -> io::Result<()> {
     let mut b = Vec::new();
     frame.write_to(&mut b, max)?;
     stream.write_all(&b).await
 }
-async fn read_frame(stream: &mut TcpStream, max: usize) -> io::Result<OpenWireFrame> {
+async fn read_frame(
+    stream: &mut (impl AsyncRead + Unpin),
+    max: usize,
+) -> io::Result<OpenWireFrame> {
     let n = stream.read_u32().await? as usize;
     if n == 0 || n > max {
         return Err(io::Error::new(

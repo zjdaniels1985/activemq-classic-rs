@@ -1,0 +1,21 @@
+[broker]
+name = "openwire-interop"
+
+[protocols.openwire]
+enabled = true
+bind = "127.0.0.1:61616"
+
+[protocols.stomp]
+enabled = false
+
+[protocols.amqp]
+enabled = false
+
+[protocols.mqtt]
+enabled = false
+
+[persistence]
+backend = "memory"
+
+[web_console]
+enabled = false

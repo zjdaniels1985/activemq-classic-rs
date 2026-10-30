@@ -57,6 +57,7 @@ pub struct CommandHeader {
 pub struct IncomingMessage {
     pub header: CommandHeader,
     pub tx: Option<crate::core::TxId>,
+    pub producer_id: Option<WireId>,
     pub destination: Option<WireDestination>,
     pub message_id: String,
     pub correlation_id: Option<String>,
@@ -73,6 +74,7 @@ pub struct IncomingMessage {
     pub compressed: bool,
     pub broker_path: Vec<String>,
     pub command_type: u8,
+    pub advisory: Option<crate::core::AdvisoryData>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -102,6 +104,7 @@ pub struct ProducerInfo {
     pub header: CommandHeader,
     pub id: WireId,
     pub destination: Option<WireDestination>,
+    pub window_size: i32,
 }
 
 #[derive(Clone, Debug)]
@@ -137,16 +140,28 @@ impl<'a> Decoder<'a> {
         Ok(self.u8()? != 0)
     }
     pub fn i16(&mut self) -> io::Result<i16> {
-        Ok(i16::from_be_bytes(read_array(&mut self.input)?))
+        let position = self.position();
+        Ok(i16::from_be_bytes(
+            read_array(&mut self.input).map_err(|error| positioned_error(error, position))?,
+        ))
     }
     pub fn u16(&mut self) -> io::Result<u16> {
-        Ok(u16::from_be_bytes(read_array(&mut self.input)?))
+        let position = self.position();
+        Ok(u16::from_be_bytes(
+            read_array(&mut self.input).map_err(|error| positioned_error(error, position))?,
+        ))
     }
     pub fn i32(&mut self) -> io::Result<i32> {
-        Ok(i32::from_be_bytes(read_array(&mut self.input)?))
+        let position = self.position();
+        Ok(i32::from_be_bytes(
+            read_array(&mut self.input).map_err(|error| positioned_error(error, position))?,
+        ))
     }
     pub fn i64(&mut self) -> io::Result<i64> {
-        Ok(i64::from_be_bytes(read_array(&mut self.input)?))
+        let position = self.position();
+        Ok(i64::from_be_bytes(
+            read_array(&mut self.input).map_err(|error| positioned_error(error, position))?,
+        ))
     }
     pub fn string(&mut self) -> io::Result<Option<String>> {
         if !self.bool()? {
@@ -154,7 +169,10 @@ impl<'a> Decoder<'a> {
         }
         let length = usize::from(self.u16()?);
         let mut bytes = vec![0; length];
-        self.input.read_exact(&mut bytes)?;
+        let position = self.position();
+        self.input
+            .read_exact(&mut bytes)
+            .map_err(|error| positioned_error(error, position))?;
         Ok(Some(decode_modified_utf8(&bytes)?))
     }
     pub fn bytes(&mut self, max: usize) -> io::Result<Option<Vec<u8>>> {
@@ -167,7 +185,10 @@ impl<'a> Decoder<'a> {
             return Err(invalid("OpenWire byte sequence exceeds configured maximum"));
         }
         let mut bytes = vec![0; length];
-        self.input.read_exact(&mut bytes)?;
+        let position = self.position();
+        self.input
+            .read_exact(&mut bytes)
+            .map_err(|error| positioned_error(error, position))?;
         Ok(Some(bytes))
     }
     pub fn header(&mut self) -> io::Result<CommandHeader> {
@@ -177,12 +198,16 @@ impl<'a> Decoder<'a> {
         })
     }
     pub fn nested(&mut self) -> io::Result<Option<(u8, Decoder<'a>)>> {
+        self.nested_version(12)
+    }
+
+    pub fn nested_version(&mut self, version: i32) -> io::Result<Option<(u8, Decoder<'a>)>> {
         if !self.bool()? {
             return Ok(None);
         }
         let kind = self.u8()?;
         let start = self.position() as usize;
-        let end = nested_end(self.input.get_ref(), start, kind)?;
+        let end = nested_end_version(self.input.get_ref(), start, kind, version)?;
         let data = &self.input.get_ref()[start..end];
         self.input.set_position(end as u64);
         Ok(Some((kind, Decoder::new(data))))
@@ -252,7 +277,7 @@ impl<'a> Decoder<'a> {
     }
 }
 
-fn nested_end(bytes: &[u8], start: usize, kind: u8) -> io::Result<usize> {
+fn nested_end_version(bytes: &[u8], start: usize, kind: u8, version: i32) -> io::Result<usize> {
     let mut d = Decoder::new(
         bytes
             .get(start..)
@@ -263,7 +288,9 @@ fn nested_end(bytes: &[u8], start: usize, kind: u8) -> io::Result<usize> {
             d.string()?;
         }
         110 => {
-            d.string()?;
+            if version >= 10 {
+                d.string()?;
+            }
             d.skip_nested()?;
             d.i64()?;
             d.i64()?;
@@ -289,6 +316,86 @@ fn nested_end(bytes: &[u8], start: usize, kind: u8) -> io::Result<usize> {
             d.bytes(64 * 1024)?;
             d.bytes(64 * 1024)?;
         }
+        3 => {
+            d.header()?;
+            d.id(120)?;
+            d.string()?;
+            d.string()?;
+            d.string()?;
+            skip_broker_path(&mut d)?;
+            let flags = if version >= 6 {
+                5
+            } else if version == 1 {
+                2
+            } else {
+                3
+            };
+            for _ in 0..flags {
+                d.bool()?;
+            }
+            if version >= 8 {
+                d.string()?;
+            }
+        }
+        5 => {
+            d.header()?;
+            d.id(122)?;
+            d.bool()?;
+            if version >= 4 {
+                d.destination()?;
+            }
+            d.i32()?;
+            d.i32()?;
+            d.bool()?;
+            d.string()?;
+            if version >= 10 {
+                d.string()?;
+            }
+            d.string()?;
+            d.bool()?;
+            d.bool()?;
+            d.bool()?;
+            d.i8()?;
+            skip_broker_path(&mut d)?;
+            if version >= 4 {
+                d.skip_nested()?;
+            }
+            d.bool()?;
+            d.bool()?;
+            d.bool()?;
+            if version >= 4 {
+                d.skip_object_array(1024)?;
+            }
+        }
+        6 => {
+            d.header()?;
+            d.id(123)?;
+            d.destination()?;
+            skip_broker_path(&mut d)?;
+            if version >= 2 {
+                d.bool()?;
+            }
+            if version >= 3 {
+                d.i32()?;
+            }
+        }
+        8 => {
+            d.header()?;
+            d.id(120)?;
+            if version >= 4 {
+                d.destination()?;
+            }
+            d.i8()?;
+            d.i64()?;
+            skip_broker_path(&mut d)?;
+        }
+        12 => {
+            d.header()?;
+            d.nested()?;
+            if version >= 5 {
+                d.i64()?;
+            }
+        }
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -299,21 +406,39 @@ fn nested_end(bytes: &[u8], start: usize, kind: u8) -> io::Result<usize> {
     Ok(start + d.position() as usize)
 }
 
+fn skip_broker_path(d: &mut Decoder<'_>) -> io::Result<()> {
+    if d.bool()? {
+        let count = usize::from(d.u16()?);
+        if count > 1024 {
+            return Err(invalid("broker path too large"));
+        }
+        for _ in 0..count {
+            d.skip_nested()?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 pub fn decode_consumer(frame: &OpenWireFrame) -> io::Result<ConsumerInfo> {
+    decode_consumer_version(frame, 12)
+}
+
+pub fn decode_consumer_version(frame: &OpenWireFrame, version: i32) -> io::Result<ConsumerInfo> {
     let mut d = Decoder::new(&frame.payload);
     let header = d.header()?;
     let id = d
         .id(122)?
         .ok_or_else(|| invalid("ConsumerInfo is missing ConsumerId"))?;
     let browser = d.bool()?;
-    let destination = d
-        .destination()?
-        .ok_or_else(|| invalid("ConsumerInfo is missing destination"))?;
+    let destination = if version >= 4 { d.destination()? } else { None };
     let prefetch = d.i32()?;
     d.i32()?;
     d.bool()?;
     let selector = d.string()?;
-    let _client_id = d.string()?;
+    if version >= 10 {
+        d.string()?;
+    }
     let subscription_name = d.string()?;
     let no_local = d.bool()?;
     let exclusive = d.bool()?;
@@ -330,16 +455,22 @@ pub fn decode_consumer(frame: &OpenWireFrame) -> io::Result<ConsumerInfo> {
             broker_path.push(nested.string()?.unwrap_or_default());
         }
     }
-    d.skip_nested()?;
+    if version >= 4 {
+        d.skip_nested()?;
+    }
     let network = d.bool()?;
     d.bool()?;
     d.bool()?;
-    d.skip_object_array(1024)?;
+    if version >= 4 {
+        d.skip_object_array(1024)?;
+    }
     Ok(ConsumerInfo {
         header,
         id,
         browser,
-        destination,
+        destination: destination.ok_or_else(|| {
+            invalid("OpenWire versions 1-3 do not encode a ConsumerInfo destination")
+        })?,
         prefetch,
         selector,
         subscription_name,
@@ -351,7 +482,12 @@ pub fn decode_consumer(frame: &OpenWireFrame) -> io::Result<ConsumerInfo> {
     })
 }
 
+#[cfg(test)]
 pub fn decode_producer(frame: &OpenWireFrame) -> io::Result<ProducerInfo> {
+    decode_producer_version(frame, 12)
+}
+
+pub fn decode_producer_version(frame: &OpenWireFrame, version: i32) -> io::Result<ProducerInfo> {
     let mut d = Decoder::new(&frame.payload);
     let header = d.header()?;
     let id = d
@@ -367,30 +503,57 @@ pub fn decode_producer(frame: &OpenWireFrame) -> io::Result<ProducerInfo> {
             d.skip_nested()?;
         }
     }
-    d.bool()?;
-    let _window_size = d.i32()?;
+    if version >= 2 {
+        d.bool()?;
+    }
+    let window_size = if version >= 3 { d.i32()? } else { 0 };
     Ok(ProducerInfo {
         header,
         id,
         destination,
+        window_size,
     })
 }
 
+pub fn decode_destination_info(
+    frame: &OpenWireFrame,
+    version: i32,
+) -> io::Result<(CommandHeader, Option<WireDestination>, u8)> {
+    let mut d = Decoder::new(&frame.payload);
+    let header = d.header()?;
+    d.id(120)?;
+    let destination = if version >= 4 { d.destination()? } else { None };
+    let operation = d.u8()?;
+    d.i64()?;
+    d.skip_object_array(1024)?;
+    Ok((header, destination, operation))
+}
+
+#[cfg(test)]
 pub fn decode_message(frame: &OpenWireFrame, max: usize) -> io::Result<IncomingMessage> {
-    decode_message_with_consumed(frame, max).map(|(message, _)| message)
+    decode_message_version(frame, max, 12)
+}
+
+pub fn decode_message_version(
+    frame: &OpenWireFrame,
+    max: usize,
+    version: i32,
+) -> io::Result<IncomingMessage> {
+    decode_message_with_consumed(frame, max, version).map(|(message, _)| message)
 }
 
 fn decode_message_with_consumed(
     frame: &OpenWireFrame,
     max: usize,
+    version: i32,
 ) -> io::Result<(IncomingMessage, usize)> {
     let mut d = Decoder::new(&frame.payload);
     let header = d.header()?;
-    let _producer = d.id(123)?;
+    let producer_id = d.id(123)?;
     let destination = d.destination()?;
     let tx = decode_tx(d.nested()?)?;
     let _original = d.destination()?;
-    let msg_id = decode_message_id(&mut d)?.unwrap_or_default();
+    let msg_id = decode_message_id(&mut d, version)?.unwrap_or_default();
     d.skip_nested()?;
     let group_id = d.string()?;
     let group_sequence = d.i32()?;
@@ -403,7 +566,7 @@ fn decode_message_with_consumed(
     let message_type = d.string()?;
     let body = d.bytes(max)?.unwrap_or_default();
     let properties = d.bytes(max)?.unwrap_or_default();
-    d.skip_nested()?;
+    let advisory = decode_advisory(d.nested_version(version)?, version, destination.as_ref())?;
     d.skip_nested()?;
     let compressed = d.bool()?;
     let _redelivery = d.i32()?;
@@ -421,15 +584,22 @@ fn decode_message_with_consumed(
     d.i64()?;
     d.string()?;
     d.bool()?;
-    d.bool()?;
-    d.skip_object_array(1024)?;
-    d.i64()?;
-    d.i64()?;
-    d.bool()?;
+    if version >= 2 {
+        d.bool()?;
+    }
+    if version >= 3 {
+        d.skip_object_array(1024)?;
+        d.i64()?;
+        d.i64()?;
+    }
+    if version >= 10 {
+        d.bool()?;
+    }
     Ok((
         IncomingMessage {
             header,
             tx,
+            producer_id,
             destination,
             message_id: msg_id,
             correlation_id,
@@ -446,19 +616,244 @@ fn decode_message_with_consumed(
             compressed,
             broker_path,
             command_type: frame.command_type,
+            advisory,
         },
         d.position() as usize,
     ))
 }
 
-fn decode_message_id(d: &mut Decoder<'_>) -> io::Result<Option<String>> {
-    let Some((kind, mut obj)) = d.nested()? else {
+fn decode_advisory(
+    object: Option<(u8, Decoder<'_>)>,
+    version: i32,
+    topic: Option<&WireDestination>,
+) -> io::Result<Option<crate::core::AdvisoryData>> {
+    use crate::core::{AdvisoryData, Destination};
+    let Some((kind, mut d)) = object else {
+        return Ok(None);
+    };
+    let data = match kind {
+        5 => {
+            let _header = d.header()?;
+            let id = d
+                .id(122)?
+                .ok_or_else(|| invalid("advisory ConsumerInfo ID missing"))?;
+            d.bool()?;
+            let destination = if version >= 4 { d.destination()? } else { None }
+                .ok_or_else(|| invalid("advisory ConsumerInfo destination missing"))?;
+            let prefetch = d.i32()?.max(0) as u32;
+            d.i32()?;
+            d.bool()?;
+            let selector = d.string()?;
+            let client_id = if version >= 10 { d.string()? } else { None };
+            let durable_name = d.string()?;
+            d.bool()?;
+            d.bool()?;
+            d.bool()?;
+            d.i8()?;
+            let broker_path = decode_broker_path(&mut d)?;
+            if version >= 4 {
+                d.skip_nested()?;
+            }
+            let network = d.bool()?;
+            d.bool()?;
+            d.bool()?;
+            if version >= 4 {
+                d.skip_object_array(1024)?;
+            }
+            let core_destination =
+                Destination::new(destination_kind(&destination), destination.name);
+            Some(AdvisoryData::ConsumerAdded {
+                connection: numeric_wire_id(&id),
+                consumer: id.value.max(0) as u64,
+                external_id: Some(id.display()),
+                destination: core_destination,
+                selector,
+                durable_name,
+                client_id,
+                network,
+                broker_path,
+                prefetch,
+            })
+        }
+        6 => {
+            let _header = d.header()?;
+            let id = d
+                .id(123)?
+                .ok_or_else(|| invalid("advisory ProducerInfo ID missing"))?;
+            let destination = d
+                .destination()?
+                .map(|d| Destination::new(destination_kind(&d), d.name));
+            let _ = decode_broker_path(&mut d)?;
+            if version >= 2 {
+                d.bool()?;
+            }
+            if version >= 3 {
+                d.i32()?;
+            }
+            Some(AdvisoryData::ProducerAdded {
+                connection: numeric_wire_id(&id),
+                producer: id.value.max(0) as u64,
+                destination,
+            })
+        }
+        8 => {
+            let _header = d.header()?;
+            d.id(120)?;
+            let destination = d
+                .destination()?
+                .ok_or_else(|| invalid("advisory DestinationInfo destination missing"))?;
+            let operation = d.u8()?;
+            d.i64()?;
+            let _ = decode_broker_path(&mut d)?;
+            let destination = Destination::new(destination_kind(&destination), destination.name);
+            Some(if operation == 0 {
+                AdvisoryData::DestinationAdded(destination)
+            } else {
+                AdvisoryData::DestinationRemoved(destination)
+            })
+        }
+        3 => {
+            let _header = d.header()?;
+            let id = d
+                .id(120)?
+                .ok_or_else(|| invalid("advisory ConnectionInfo ID missing"))?;
+            let client_id = d.string()?;
+            d.string()?;
+            let username = d.string()?;
+            let _ = decode_broker_path(&mut d)?;
+            for _ in 0..if version >= 6 {
+                5
+            } else if version == 1 {
+                2
+            } else {
+                3
+            } {
+                d.bool()?;
+            }
+            let remote_address = if version >= 8 {
+                d.string()?.unwrap_or_default()
+            } else {
+                String::new()
+            };
+            Some(AdvisoryData::ConnectionAdded {
+                connection: numeric_wire_id(&id),
+                client_id,
+                username,
+                remote_address,
+            })
+        }
+        12 => {
+            let _header = d.header()?;
+            let Some((id_kind, id)) = d.nested()? else {
+                return Ok(None);
+            };
+            let wire_id = decode_wire_id_body(id_kind, id)?;
+            if version >= 5 {
+                d.i64()?;
+            }
+            match id_kind {
+                120 => Some(AdvisoryData::ConnectionRemoved {
+                    connection: numeric_wire_id(&wire_id),
+                    client_id: None,
+                }),
+                122 => Some(AdvisoryData::ConsumerRemoved {
+                    connection: numeric_wire_id(&wire_id),
+                    consumer: wire_id.value.max(0) as u64,
+                    external_id: Some(wire_id.display()),
+                    destination: advisory_destination(topic),
+                }),
+                123 => Some(AdvisoryData::ProducerRemoved {
+                    connection: numeric_wire_id(&wire_id),
+                    producer: wire_id.value.max(0) as u64,
+                }),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    Ok(data)
+}
+
+fn advisory_destination(topic: Option<&WireDestination>) -> crate::core::Destination {
+    let Some(topic) = topic else {
+        return crate::core::Destination::queue("");
+    };
+    let name = topic.name.as_str();
+    for (prefix, kind) in [
+        (
+            "ActiveMQ.Advisory.Consumer.Queue.",
+            crate::core::DestinationKind::Queue,
+        ),
+        (
+            "ActiveMQ.Advisory.Consumer.Topic.",
+            crate::core::DestinationKind::Topic,
+        ),
+        (
+            "ActiveMQ.Advisory.Consumer.TempQueue.",
+            crate::core::DestinationKind::TempQueue,
+        ),
+        (
+            "ActiveMQ.Advisory.Consumer.TempTopic.",
+            crate::core::DestinationKind::TempTopic,
+        ),
+    ] {
+        if let Some(destination) = name.strip_prefix(prefix) {
+            return crate::core::Destination::new(kind, destination);
+        }
+    }
+    crate::core::Destination::queue("")
+}
+
+fn decode_broker_path(d: &mut Decoder<'_>) -> io::Result<Vec<String>> {
+    if !d.bool()? {
+        return Ok(Vec::new());
+    }
+    let count = usize::from(d.u16()?);
+    if count > 1024 {
+        return Err(invalid("broker path too large"));
+    }
+    let mut path = Vec::with_capacity(count);
+    for _ in 0..count {
+        let (_, mut broker) = d.nested()?.ok_or_else(|| invalid("null broker path ID"))?;
+        path.push(broker.string()?.unwrap_or_default());
+    }
+    Ok(path)
+}
+
+fn decode_wire_id_body(kind: u8, mut d: Decoder<'_>) -> io::Result<WireId> {
+    let connection = d.string()?.unwrap_or_default();
+    let (session, value) = match kind {
+        120 => (0, 0),
+        121 => (d.i64()?, 0),
+        122 => (d.i64()?, d.i64()?),
+        123 => {
+            let value = d.i64()?;
+            (d.i64()?, value)
+        }
+        _ => return Err(invalid("unsupported advisory ID type")),
+    };
+    Ok(WireId {
+        connection,
+        session,
+        value,
+    })
+}
+
+fn numeric_wire_id(id: &WireId) -> u64 {
+    id.connection
+        .rsplit_once('-')
+        .and_then(|(_, suffix)| suffix.parse().ok())
+        .unwrap_or_else(|| id.value.max(0) as u64)
+}
+
+fn decode_message_id(d: &mut Decoder<'_>, version: i32) -> io::Result<Option<String>> {
+    let Some((kind, mut obj)) = d.nested_version(version)? else {
         return Ok(None);
     };
     if kind != 110 {
         return Err(invalid("expected MessageId"));
     }
-    let text = obj.string()?;
+    let text = if version >= 10 { obj.string()? } else { None };
     let producer = obj.id(123)?;
     let sequence = obj.i64()?;
     obj.i64()?;
@@ -469,7 +864,12 @@ fn decode_message_id(d: &mut Decoder<'_>) -> io::Result<Option<String>> {
     })))
 }
 
+#[cfg(test)]
 pub fn decode_ack(frame: &OpenWireFrame) -> io::Result<AckInfo> {
+    decode_ack_version(frame, 12)
+}
+
+pub fn decode_ack_version(frame: &OpenWireFrame, version: i32) -> io::Result<AckInfo> {
     let mut d = Decoder::new(&frame.payload);
     let header = d.header()?;
     d.destination()?;
@@ -478,10 +878,12 @@ pub fn decode_ack(frame: &OpenWireFrame) -> io::Result<AckInfo> {
         .id(122)?
         .ok_or_else(|| invalid("MessageAck is missing ConsumerId"))?;
     let ack_type = d.u8()?;
-    let _first = decode_message_id(&mut d)?;
-    let message_id = decode_message_id(&mut d)?;
+    let _first = decode_message_id(&mut d, version)?;
+    let message_id = decode_message_id(&mut d, version)?;
     let count = d.i32()?;
-    let _poison_present = d.bool()?;
+    if version >= 7 {
+        let _poison_present = d.bool()?;
+    }
     Ok(AckInfo {
         header,
         consumer,
@@ -581,9 +983,9 @@ pub fn exception(header: &CommandHeader, class: &str, message: &str) -> OpenWire
     }
 }
 
-pub fn encode_broker_info(name: &str) -> OpenWireFrame {
+pub fn encode_broker_info(id: &str, name: &str) -> OpenWireFrame {
     let mut p = base(0, false);
-    nested_string(&mut p, 124, Some(name));
+    nested_string(&mut p, 124, Some(id));
     let _ = write_string(&mut p, Some(""));
     p.push(0);
     let _ = write_string(&mut p, Some(name));
@@ -595,6 +997,21 @@ pub fn encode_broker_info(name: &str) -> OpenWireFrame {
         command_type: 2,
         payload: p,
     }
+}
+
+pub fn decode_broker_info(frame: &OpenWireFrame) -> io::Result<Option<String>> {
+    if frame.command_type != 2 {
+        return Err(invalid("expected BrokerInfo"));
+    }
+    let mut d = Decoder::new(&frame.payload);
+    d.header()?;
+    let Some((kind, mut broker_id)) = d.nested()? else {
+        return Ok(None);
+    };
+    if kind != 124 {
+        return Err(invalid("BrokerInfo has an invalid BrokerId"));
+    }
+    broker_id.string()
 }
 
 pub fn encode_wire_format_info(name: &str, frame_limit: usize, version: i32) -> OpenWireFrame {
@@ -654,7 +1071,7 @@ pub fn validate_wire_format(frame: &OpenWireFrame) -> io::Result<(i32, Option<u6
         return Err(invalid("invalid OpenWire magic"));
     }
     let version = d.i32()?;
-    if !(1..=12).contains(&version) {
+    if !(4..=12).contains(&version) {
         return Err(invalid("unsupported OpenWire version"));
     }
     let properties = d.bytes(frame.payload.len())?;
@@ -720,7 +1137,10 @@ pub type ConnectionInfoFields = (
     Option<String>,
 );
 
-pub fn decode_connection_info(frame: &OpenWireFrame) -> io::Result<ConnectionInfoFields> {
+pub fn decode_connection_info_version(
+    frame: &OpenWireFrame,
+    version: i32,
+) -> io::Result<ConnectionInfoFields> {
     let mut d = Decoder::new(&frame.payload);
     let h = d.header()?;
     let _id = d.id(120)?;
@@ -736,14 +1156,26 @@ pub fn decode_connection_info(frame: &OpenWireFrame) -> io::Result<ConnectionInf
             d.skip_nested()?;
         }
     }
-    for _ in 0..5 {
+    let flags = if version >= 6 {
+        5
+    } else if version == 1 {
+        2
+    } else {
+        3
+    };
+    for _ in 0..flags {
         d.bool()?;
     }
-    d.string()?;
+    if version >= 8 {
+        d.string()?;
+    }
     Ok((h, client, user, password))
 }
 
-pub fn decode_remove(frame: &OpenWireFrame) -> io::Result<(CommandHeader, Option<(u8, WireId)>)> {
+pub fn decode_remove_version(
+    frame: &OpenWireFrame,
+    version: i32,
+) -> io::Result<(CommandHeader, Option<(u8, WireId)>)> {
     let mut d = Decoder::new(&frame.payload);
     let h = d.header()?;
     let Some((kind, mut obj)) = d.nested()? else {
@@ -777,6 +1209,9 @@ pub fn decode_remove(frame: &OpenWireFrame) -> io::Result<(CommandHeader, Option
         }
         _ => return Err(invalid("unsupported RemoveInfo identifier")),
     };
+    if version >= 5 {
+        d.i64()?;
+    }
     Ok((h, Some((kind, id))))
 }
 
@@ -793,12 +1228,13 @@ pub fn decode_pull(frame: &OpenWireFrame) -> io::Result<(CommandHeader, WireId, 
     Ok((h, id, timeout))
 }
 
-pub fn encode_dispatch(
+pub fn encode_dispatch_version(
     consumer: &WireId,
     destination: &WireDestination,
     message: &crate::core::Message,
     command_id: i64,
     redelivery: u32,
+    version: i32,
 ) -> OpenWireFrame {
     let mut p = base(0, false);
     nested_id(&mut p, 122, consumer);
@@ -820,7 +1256,9 @@ pub fn encode_dispatch(
     p.push(0);
     p.push(1);
     p.push(110);
-    let _ = write_string(&mut p, Some(&message.message_id));
+    if version >= 10 {
+        let _ = write_string(&mut p, Some(&message.message_id));
+    }
     nested_id(
         &mut p,
         123,
@@ -849,7 +1287,7 @@ pub fn encode_dispatch(
         write_byte_sequence(&mut p, Some(&marshal_properties(&message.properties)));
     }
     if let Some(advisory) = &message.advisory {
-        encode_advisory(&mut p, advisory);
+        encode_advisory(&mut p, advisory, version);
     } else {
         p.push(0);
     }
@@ -868,11 +1306,17 @@ pub fn encode_dispatch(
     p.extend_from_slice(&0i64.to_be_bytes());
     let _ = write_string(&mut p, message.user_id.as_deref());
     p.push(0);
-    p.push(0);
-    p.push(0);
-    p.extend_from_slice(&0i64.to_be_bytes());
-    p.extend_from_slice(&message.broker_in_time.to_be_bytes());
-    p.push(0);
+    if version >= 2 {
+        p.push(0);
+    }
+    if version >= 3 {
+        p.push(0);
+        p.extend_from_slice(&0i64.to_be_bytes());
+        p.extend_from_slice(&message.broker_in_time.to_be_bytes());
+        if version >= 10 {
+            p.push(0);
+        }
+    }
     p.extend_from_slice(&(redelivery as i32).to_be_bytes());
     OpenWireFrame {
         command_type: 21,
@@ -880,7 +1324,7 @@ pub fn encode_dispatch(
     }
 }
 
-fn encode_advisory(out: &mut Vec<u8>, advisory: &crate::core::AdvisoryData) {
+fn encode_advisory(out: &mut Vec<u8>, advisory: &crate::core::AdvisoryData, version: i32) {
     use crate::core::AdvisoryData;
     match advisory {
         AdvisoryData::DestinationAdded(destination)
@@ -903,6 +1347,7 @@ fn encode_advisory(out: &mut Vec<u8>, advisory: &crate::core::AdvisoryData) {
             destination,
             selector,
             durable_name,
+            client_id,
             network,
             broker_path,
             prefetch,
@@ -926,7 +1371,9 @@ fn encode_advisory(out: &mut Vec<u8>, advisory: &crate::core::AdvisoryData) {
             out.extend_from_slice(&0i32.to_be_bytes());
             out.push(1);
             let _ = write_string(out, selector.as_deref());
-            let _ = write_string(out, None);
+            if version >= 10 {
+                let _ = write_string(out, client_id.as_deref());
+            }
             let _ = write_string(out, durable_name.as_deref());
             out.push(0);
             out.push(0);
@@ -966,8 +1413,111 @@ fn encode_advisory(out: &mut Vec<u8>, advisory: &crate::core::AdvisoryData) {
             out.extend_from_slice(&base(0, false));
             nested_id(out, 122, &id);
             let _ = destination;
+            if version >= 5 {
+                out.extend_from_slice(&0i64.to_be_bytes());
+            }
         }
-        _ => out.push(0),
+        AdvisoryData::ProducerAdded {
+            connection,
+            producer,
+            destination,
+        } => {
+            out.push(1);
+            out.push(6);
+            out.extend_from_slice(&base(0, false));
+            nested_id(
+                out,
+                123,
+                &WireId {
+                    connection: format!("rust-{connection}"),
+                    session: 1,
+                    value: *producer as i64,
+                },
+            );
+            if let Some(destination) = destination {
+                nested_destination(out, &wire_destination(destination));
+            } else {
+                out.push(0);
+            }
+            out.push(0);
+            if version >= 2 {
+                out.push(0);
+            }
+            if version >= 3 {
+                out.extend_from_slice(&0i32.to_be_bytes());
+            }
+        }
+        AdvisoryData::ProducerRemoved {
+            connection,
+            producer,
+        } => {
+            out.push(1);
+            out.push(12);
+            out.extend_from_slice(&base(0, false));
+            nested_id(
+                out,
+                123,
+                &WireId {
+                    connection: format!("rust-{connection}"),
+                    session: 1,
+                    value: *producer as i64,
+                },
+            );
+            if version >= 5 {
+                out.extend_from_slice(&0i64.to_be_bytes());
+            }
+        }
+        AdvisoryData::ConnectionAdded {
+            connection,
+            client_id,
+            username,
+            remote_address,
+        } => {
+            out.push(1);
+            out.push(3);
+            out.extend_from_slice(&base(0, false));
+            nested_id(
+                out,
+                120,
+                &WireId {
+                    connection: format!("rust-{connection}"),
+                    session: 0,
+                    value: 0,
+                },
+            );
+            let _ = write_string(out, client_id.as_deref());
+            let _ = write_string(out, None);
+            let _ = write_string(out, username.as_deref());
+            out.push(0);
+            let flags = if version >= 6 {
+                5
+            } else if version == 1 {
+                2
+            } else {
+                3
+            };
+            out.extend(std::iter::repeat_n(0, flags));
+            if version >= 8 {
+                let _ = write_string(out, Some(remote_address));
+            }
+        }
+        AdvisoryData::ConnectionRemoved { connection, .. } => {
+            out.push(1);
+            out.push(12);
+            out.extend_from_slice(&base(0, false));
+            nested_id(
+                out,
+                120,
+                &WireId {
+                    connection: format!("rust-{connection}"),
+                    session: 0,
+                    value: 0,
+                },
+            );
+            if version >= 5 {
+                out.extend_from_slice(&0i64.to_be_bytes());
+            }
+        }
     }
 }
 fn parse_wire_id(text: &str) -> Option<WireId> {
@@ -1361,6 +1911,9 @@ fn read_u32(r: &mut impl Read) -> io::Result<u32> {
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
+fn positioned_error(error: io::Error, position: u64) -> io::Error {
+    io::Error::new(error.kind(), format!("{} at byte offset {position}", error))
+}
 
 pub fn client_connection_info(
     command_id: i32,
@@ -1390,6 +1943,41 @@ pub fn client_session_info(command_id: i32, id: &WireId) -> OpenWireFrame {
         payload: p,
     }
 }
+pub fn client_destination_info(
+    command_id: i32,
+    connection: &WireId,
+    destination: &WireDestination,
+    operation: u8,
+) -> OpenWireFrame {
+    let mut p = base(command_id, true);
+    nested_id(&mut p, 120, connection);
+    nested_destination(&mut p, destination);
+    p.push(operation);
+    p.extend_from_slice(&0i64.to_be_bytes());
+    p.push(0);
+    OpenWireFrame {
+        command_type: 8,
+        payload: p,
+    }
+}
+pub fn client_remove_info(command_id: i32, id: &WireId) -> OpenWireFrame {
+    let mut p = base(command_id, true);
+    nested_id(&mut p, 122, id);
+    p.extend_from_slice(&0i64.to_be_bytes());
+    OpenWireFrame {
+        command_type: 12,
+        payload: p,
+    }
+}
+pub fn producer_ack(producer: &WireId, size: i32) -> OpenWireFrame {
+    let mut p = base(0, false);
+    nested_id(&mut p, 123, producer);
+    p.extend_from_slice(&size.to_be_bytes());
+    OpenWireFrame {
+        command_type: 19,
+        payload: p,
+    }
+}
 pub fn client_producer_info(
     command_id: i32,
     id: &WireId,
@@ -1410,12 +1998,25 @@ pub fn client_producer_info(
         payload: p,
     }
 }
+#[cfg(test)]
 pub fn client_consumer_info(
     command_id: i32,
     id: &WireId,
     destination: &WireDestination,
     prefetch: u32,
     selector: Option<&str>,
+) -> OpenWireFrame {
+    client_consumer_info_options(command_id, id, destination, prefetch, selector, false, &[])
+}
+
+pub fn client_consumer_info_options(
+    command_id: i32,
+    id: &WireId,
+    destination: &WireDestination,
+    prefetch: u32,
+    selector: Option<&str>,
+    network: bool,
+    broker_path: &[String],
 ) -> OpenWireFrame {
     let mut p = base(command_id, true);
     nested_id(&mut p, 122, id);
@@ -1428,9 +2029,17 @@ pub fn client_consumer_info(
     let _ = write_string(&mut p, None);
     let _ = write_string(&mut p, None);
     p.extend_from_slice(&[0, 0, 0, 0]);
+    if broker_path.is_empty() {
+        p.push(0);
+    } else {
+        p.push(1);
+        p.extend_from_slice(&(broker_path.len() as u16).to_be_bytes());
+        for broker in broker_path {
+            nested_string(&mut p, 124, Some(broker));
+        }
+    }
     p.push(0);
-    p.push(0);
-    p.extend_from_slice(&[0, 0, 0]);
+    p.extend_from_slice(&[u8::from(network), 0, 0]);
     p.push(0);
     OpenWireFrame {
         command_type: 5,
@@ -1471,7 +2080,12 @@ pub fn client_message(
     } else {
         write_byte_sequence(&mut p, Some(&marshal_properties(&message.properties)))
     }
-    p.push(0);
+
+    if let Some(advisory) = &message.advisory {
+        encode_advisory(&mut p, advisory, 12);
+    } else {
+        p.push(0);
+    }
     p.push(0);
     p.push(0);
     p.extend_from_slice(&0i32.to_be_bytes());
@@ -1494,6 +2108,13 @@ pub fn client_message(
         command_type: message_type_code(&message.body),
         payload: p,
     }
+}
+pub fn encode_client_message(
+    command_id: i32,
+    producer: &WireId,
+    message: &crate::core::Message,
+) -> OpenWireFrame {
+    client_message(command_id, producer, message)
 }
 pub fn client_ack(
     command_id: i32,
@@ -1532,6 +2153,14 @@ pub fn decode_dispatch(
     frame: &OpenWireFrame,
     max: usize,
 ) -> io::Result<(WireId, WireDestination, IncomingMessage, u32)> {
+    decode_dispatch_version(frame, max, 12)
+}
+
+pub fn decode_dispatch_version(
+    frame: &OpenWireFrame,
+    max: usize,
+    version: i32,
+) -> io::Result<(WireId, WireDestination, IncomingMessage, u32)> {
     if frame.command_type != 21 {
         return Err(invalid("expected MessageDispatch"));
     };
@@ -1555,6 +2184,7 @@ pub fn decode_dispatch(
             payload,
         },
         max,
+        version,
     )?;
     d.input.set_position((start + consumed) as u64);
     let redelivery = d.i32()? as u32;
@@ -1651,5 +2281,56 @@ mod tests {
             Some(message.message_id.as_str())
         );
         assert_eq!(decoded.count, 1);
+    }
+
+    #[test]
+    fn advisory_data_structure_round_trips_network_consumer_identity() {
+        use crate::core::{AdvisoryData, Destination, DestinationKind, Message};
+        let producer = WireId {
+            connection: "ID:bridge".into(),
+            session: 1,
+            value: 1,
+        };
+        let mut advisory_message = Message::text(
+            Destination::topic("ActiveMQ.Advisory.Consumer.Queue.orders"),
+            "",
+        );
+        advisory_message.advisory = Some(AdvisoryData::ConsumerAdded {
+            connection: 19,
+            consumer: 23,
+            external_id: Some("ID:bridge:1:23".into()),
+            destination: Destination::new(DestinationKind::Queue, "orders"),
+            selector: Some("region = 'west'".into()),
+            durable_name: Some("durable-orders".into()),
+            client_id: Some("bridge-client".into()),
+            network: true,
+            broker_path: vec!["origin".into(), "bridge".into()],
+            prefetch: 32,
+        });
+
+        let encoded = client_message(1, &producer, &advisory_message);
+        let decoded = decode_message(&encoded, 1024 * 1024).unwrap();
+        let Some(crate::core::AdvisoryData::ConsumerAdded {
+            external_id,
+            destination,
+            selector,
+            durable_name,
+            client_id,
+            network,
+            broker_path,
+            prefetch,
+            ..
+        }) = decoded.advisory
+        else {
+            panic!("expected ConsumerInfo advisory data");
+        };
+        assert_eq!(external_id.as_deref(), Some("ID:bridge:1:23"));
+        assert_eq!(destination.name, "orders");
+        assert_eq!(selector.as_deref(), Some("region = 'west'"));
+        assert_eq!(durable_name.as_deref(), Some("durable-orders"));
+        assert_eq!(client_id.as_deref(), Some("bridge-client"));
+        assert!(network);
+        assert_eq!(broker_path, ["origin", "bridge"]);
+        assert_eq!(prefetch, 32);
     }
 }

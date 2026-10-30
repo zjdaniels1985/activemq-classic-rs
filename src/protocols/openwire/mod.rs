@@ -3,11 +3,13 @@ mod client;
 mod codec;
 
 pub use client::{OpenWireClient, OpenWireError};
-pub use codec::OpenWireFrame;
+pub use codec::{OpenWireFrame, WireDestination, WireId};
 
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use flate2::read::ZlibDecoder;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -17,11 +19,21 @@ use tokio::time::{self, Duration, Instant};
 
 use super::ProtocolContext;
 use crate::core::{
-    AckOp, Acks, Body, ConnectInfo, ConsumerOptions, CoreError, Destination, Event, Message, Value,
+    AckOp, Acks, Body, BrokerCore, ConnectInfo, ConsumerOptions, CoreError, Destination, Event,
+    Message, Value,
 };
-use codec::{Decoder, IncomingMessage, WireDestination, WireId};
+use codec::{Decoder, IncomingMessage};
 
 const MAX_WIRE_VERSION: i32 = 12;
+const MIN_WIRE_VERSION: i32 = 4;
+
+pub fn encode_client_message(
+    producer: &WireId,
+    message: &Message,
+    command_id: i32,
+) -> OpenWireFrame {
+    codec::encode_client_message(command_id, producer, message)
+}
 
 pub async fn serve(context: ProtocolContext, listener: TcpListener) -> io::Result<()> {
     super::accept_loop("openwire", context, listener, handle_connection).await
@@ -35,6 +47,12 @@ async fn handle_connection(
     let max_size = context.max_frame_size;
     let first = read_frame(&mut stream, max_size).await?;
     let (client_version, client_idle_timeout) = codec::validate_wire_format(&first)?;
+    if client_version < MIN_WIRE_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "OpenWire versions 1-3 omit destination data required for broker routing",
+        ));
+    }
     let version = client_version.min(MAX_WIRE_VERSION);
     write_frame(
         &mut stream,
@@ -44,17 +62,19 @@ async fn handle_connection(
     .await?;
     write_frame(
         &mut stream,
-        &codec::encode_broker_info(&context.core.info().name),
+        &codec::encode_broker_info(&context.core.info().id, &context.core.info().name),
         max_size,
     )
     .await?;
 
     let mut core_connection = None;
+    let cleanup = ConnectionCleanup::new(context.core.clone());
     let mut events: Option<UnboundedReceiver<Event>> = None;
     let mut consumers: HashMap<WireId, u64> = HashMap::new();
     let mut consumer_wire: HashMap<u64, WireId> = HashMap::new();
     let mut consumer_destinations: HashMap<u64, WireDestination> = HashMap::new();
     let mut producers: HashMap<WireId, u64> = HashMap::new();
+    let mut producer_windows: HashMap<WireId, i32> = HashMap::new();
     let mut delivery_ids: HashMap<(WireId, String), u64> = HashMap::new();
     let mut command_id = 1_i64;
     let mut last_seen = Instant::now();
@@ -66,7 +86,7 @@ async fn handle_connection(
             result = read_frame(&mut stream, max_size) => {
                 let frame = match result { Ok(frame) => frame, Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break, Err(error) => return Err(error) };
                 last_seen = Instant::now();
-                process_command(&context, &remote, frame, &mut stream, max_size, &mut core_connection, &mut events, &mut consumers, &mut consumer_wire, &mut consumer_destinations, &mut producers, &mut delivery_ids).await?;
+                process_command(&context, &remote, frame, &mut stream, max_size, version, &cleanup, &mut core_connection, &mut events, &mut consumers, &mut consumer_wire, &mut consumer_destinations, &mut producers, &mut producer_windows, &mut delivery_ids).await?;
             }
             event = async {
                 match events.as_mut() {
@@ -80,7 +100,7 @@ async fn handle_connection(
                             let message = delivery.message.as_ref();
                             tracing::debug!(message_id=%message.message_id, destination=%message.destination, advisory=?message.advisory, body=?message.body, "dispatching OpenWire message");
                             let destination = codec::wire_destination(&message.destination);
-                            let frame = codec::encode_dispatch(wire, &destination, message, command_id, u32::from(delivery.redelivered).saturating_mul(message.redelivery_counter));
+                            let frame = codec::encode_dispatch_version(wire, &destination, message, command_id, u32::from(delivery.redelivered).saturating_mul(message.redelivery_counter), version);
                             command_id = command_id.wrapping_add(1);
                             delivery_ids.insert((wire.clone(), message.message_id.clone()), delivery.delivery_id);
                             write_frame(&mut stream, &frame, max_size).await?;
@@ -115,10 +135,35 @@ async fn handle_connection(
             }
         }
     }
-    if let Some(connection) = core_connection {
-        context.core.disconnect(connection);
-    }
     Ok(())
+}
+
+struct ConnectionCleanup {
+    core: Arc<BrokerCore>,
+    connection: AtomicU64,
+}
+
+impl ConnectionCleanup {
+    fn new(core: Arc<BrokerCore>) -> Self {
+        Self {
+            core,
+            connection: AtomicU64::new(0),
+        }
+    }
+
+    fn set(&self, connection: Option<u64>) {
+        self.connection
+            .store(connection.unwrap_or_default(), Ordering::Release);
+    }
+}
+
+impl Drop for ConnectionCleanup {
+    fn drop(&mut self) {
+        let connection = self.connection.swap(0, Ordering::AcqRel);
+        if connection != 0 {
+            self.core.disconnect(connection);
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -128,12 +173,15 @@ async fn process_command(
     frame: OpenWireFrame,
     stream: &mut TcpStream,
     max_size: usize,
+    wire_version: i32,
+    cleanup: &ConnectionCleanup,
     connection: &mut Option<u64>,
     events: &mut Option<UnboundedReceiver<Event>>,
     consumers: &mut HashMap<WireId, u64>,
     consumer_wire: &mut HashMap<u64, WireId>,
     consumer_destinations: &mut HashMap<u64, WireDestination>,
     producers: &mut HashMap<WireId, u64>,
+    producer_windows: &mut HashMap<WireId, i32>,
     delivery_ids: &mut HashMap<(WireId, String), u64>,
 ) -> io::Result<bool> {
     tracing::debug!(
@@ -144,7 +192,8 @@ async fn process_command(
     match frame.command_type {
         1 => Ok(false),
         3 => {
-            let (header, client_id, username, password) = codec::decode_connection_info(&frame)?;
+            let (header, client_id, username, password) =
+                codec::decode_connection_info_version(&frame, wire_version)?;
             let result = context.core.connect(ConnectInfo {
                 client_id,
                 username,
@@ -157,6 +206,7 @@ async fn process_command(
             match result {
                 Ok((id, receiver)) => {
                     *connection = Some(id);
+                    cleanup.set(Some(id));
                     *events = Some(receiver);
                     send_response(stream, &header, max_size).await?;
                 }
@@ -172,7 +222,7 @@ async fn process_command(
             Ok(true)
         }
         5 => {
-            let info = codec::decode_consumer(&frame)?;
+            let info = codec::decode_consumer_version(&frame, wire_version)?;
             tracing::debug!(selector=?info.selector, destination=%info.destination.name, "decoded ConsumerInfo");
             let Some(connection) = *connection else {
                 return send_protocol_error(
@@ -209,7 +259,7 @@ async fn process_command(
             Ok(true)
         }
         6 => {
-            let info = codec::decode_producer(&frame)?;
+            let info = codec::decode_producer_version(&frame, wire_version)?;
             let Some(connection) = *connection else {
                 return send_protocol_error(
                     stream,
@@ -220,8 +270,14 @@ async fn process_command(
                 .await;
             };
             let destination = info.destination.as_ref().map(core_destination);
+            tracing::debug!(
+                producer = %info.id.display(),
+                window_size = info.window_size,
+                "registering OpenWire producer"
+            );
             match context.core.register_producer(connection, destination) {
                 Ok(id) => {
+                    producer_windows.insert(info.id.clone(), info.window_size);
                     producers.insert(info.id, id);
                     if info.header.response_required {
                         send_response(stream, &info.header, max_size).await?;
@@ -232,18 +288,14 @@ async fn process_command(
             Ok(true)
         }
         8 => {
-            let mut d = Decoder::new(&frame.payload);
-            let header = d.header()?;
-            let _connection_id = d.id(120)?;
-            let destination = d.destination()?.ok_or_else(|| {
+            let (header, destination, operation) =
+                codec::decode_destination_info(&frame, wire_version)?;
+            let destination = destination.ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "DestinationInfo destination missing",
+                    "DestinationInfo has no destination",
                 )
             })?;
-            let operation = d.u8()?;
-            d.i64()?;
-            d.skip_object_array(1024)?;
             let Some(connection) = *connection else {
                 return send_protocol_error(
                     stream,
@@ -296,7 +348,7 @@ async fn process_command(
             Ok(true)
         }
         12 => {
-            let (header, id) = codec::decode_remove(&frame)?;
+            let (header, id) = codec::decode_remove_version(&frame, wire_version)?;
             if let (Some(conn), Some((kind, wire))) = (*connection, id) {
                 match kind {
                     122 => {
@@ -309,6 +361,7 @@ async fn process_command(
                         if let Some(producer) = producers.remove(&wire) {
                             context.core.unregister_producer(producer);
                         }
+                        producer_windows.remove(&wire);
                     }
                     120 | 121 => {}
                     _ => {}
@@ -328,7 +381,7 @@ async fn process_command(
             Ok(true)
         }
         22 => {
-            let ack = codec::decode_ack(&frame)?;
+            let ack = codec::decode_ack_version(&frame, wire_version)?;
             let Some(conn) = *connection else {
                 return send_protocol_error(
                     stream,
@@ -383,8 +436,17 @@ async fn process_command(
         }
         7 => process_transaction(context, connection, &frame, stream, max_size).await,
         23..=29 => {
-            let incoming = codec::decode_message(&frame, max_size)?;
+            let incoming =
+                codec::decode_message_version(&frame, max_size, wire_version).map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!("OpenWire v{wire_version} Message decode failed: {error}"),
+                    )
+                })?;
             let incoming_tx = incoming.tx.clone();
+            let producer_id = incoming.producer_id.clone();
+            let message_size =
+                i32::try_from(frame.payload.len().saturating_add(5)).unwrap_or(i32::MAX);
             tracing::debug!(properties_len=incoming.properties.len(), properties=?incoming.properties, "decoded OpenWire property bytes");
             let Some(conn) = *connection else {
                 return send_protocol_error(
@@ -414,6 +476,23 @@ async fn process_command(
                     tracing::debug!(destination=%message.destination, properties=?message.properties, body=?message.body, "decoded OpenWire message");
                     match context.core.send(conn, message, incoming_tx.as_ref()) {
                         Ok(()) => {
+                            if let Some(producer) = producer_id
+                                && producer_windows
+                                    .get(&producer)
+                                    .is_some_and(|window| *window > 0)
+                            {
+                                tracing::debug!(
+                                    producer = %producer.display(),
+                                    size = message_size,
+                                    "sending OpenWire producer flow-control acknowledgement"
+                                );
+                                write_frame(
+                                    stream,
+                                    &codec::producer_ack(&producer, message_size),
+                                    max_size,
+                                )
+                                .await?;
+                            }
                             if let Some(h) = command_header(&frame)? {
                                 send_response(stream, &h, max_size).await?;
                             }
@@ -440,6 +519,7 @@ async fn process_command(
                     send_response(stream, &h, max_size).await?;
                 }
                 context.core.disconnect(conn);
+                cleanup.set(None);
             }
             *connection = None;
             Ok(true)
@@ -596,6 +676,7 @@ fn convert_message(mut wire: IncomingMessage, max: usize) -> Result<Message, Str
     message.group_id = wire.group_id;
     message.group_sequence = wire.group_sequence;
     message.broker_path = wire.broker_path;
+    message.advisory = wire.advisory;
     message.properties =
         codec::unmarshal_properties(&wire.properties).map_err(|e| e.to_string())?;
     if message.group_id.is_none() {
