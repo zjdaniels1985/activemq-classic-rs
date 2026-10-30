@@ -59,6 +59,20 @@ fn core_with(policy: Policy) -> Arc<BrokerCore> {
     BrokerCore::open("test", None, policy, SecurityManager::disabled()).expect("broker")
 }
 
+#[test]
+fn temporary_destination_cannot_be_claimed_by_another_connection() {
+    let core = core_with(no_advisories());
+    let (owner, mut received) = client(&core, None);
+    let (other, _) = client(&core, None);
+    let destination = core.new_temp(owner, DestinationKind::TempQueue).unwrap();
+    core.create_temp(owner, destination.clone()).unwrap();
+    assert!(core.create_temp(other, destination.clone()).is_err());
+    core.disconnect(other);
+    core.subscribe(owner, opts(destination.clone())).unwrap();
+    send_text(&core, owner, destination, "still owned");
+    assert_eq!(texts(&deliveries(&mut received)), ["still owned"]);
+}
+
 fn opts(destination: Destination) -> ConsumerOptions {
     ConsumerOptions::new(destination)
 }

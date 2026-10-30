@@ -116,8 +116,9 @@ impl OpenWireClient {
             value: 0,
         };
         let id = self.next_command_id();
+        let client_id = client_id.unwrap_or(&connection.connection);
         self.send_and_wait(
-            codec::client_connection_info(id, &connection, client_id, username, password),
+            codec::client_connection_info(id, &connection, Some(client_id), username, password),
             id,
         )
         .await?;

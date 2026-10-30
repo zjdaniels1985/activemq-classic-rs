@@ -21,7 +21,8 @@ is evolving; do not expose this development broker to untrusted networks.
 - OpenWire with loose encoding, STOMP 1.0–1.2, MQTT 3.1/3.1.1 and AMQP 1.0
   TCP adapters.
 - Static and demand-driven OpenWire broker bridges, including destination
-  exclusions, remote authentication, URI failover and broker-path/TTL filtering.
+  exclusions, duplex forwarding, conduit/non-conduit subscriptions, temporary
+  queue replies, remote authentication, URI failover and broker-path/TTL filtering.
 - An embedded Rust/Axum administrative web console and JSON API.
 - Configurable structured logging with text/JSON output and optional log files.
 
@@ -32,6 +33,60 @@ harnesses use `stomp.py` and `paho-mqtt`. AMQP checks use Qpid Proton, including
 transactional send commit/rollback and durable subscription reconnect with
 offline delivery. These checks do not establish complete Classic behavioral
 parity.
+
+## Feature comparison
+
+This compares the current Rust implementation with the documented Apache
+ActiveMQ Classic and Apache ActiveMQ Artemis product families, not a claim
+of equivalent maturity or certification. Apache features depend on release,
+transport, plugins and configuration; see the sources below.
+**Partial** means a subset is implemented or interoperability coverage is
+limited. **Unsupported** means this repository does not implement the feature.
+
+| Feature | activemq-classic-rs (this repository) | Apache ActiveMQ Classic | Apache ActiveMQ Artemis |
+|---|---|---|---|
+| Broker runtime / native API | Rust / `BrokerCore`; no Rust translation of JMS | Java / JMS clients | Java / Core and JMS clients |
+| Existing Java JMS clients | Partial: ActiveMQ 6.2.6 client interoperability exercised; not certified JMS parity | Native ActiveMQ clients | OpenWire compatibility and Artemis JMS clients |
+| OpenWire | Partial: v4–v12 loose encoding; v1–v3 rejected; not every command supported | Native protocol | Compatibility protocol for Classic 5.12+ clients |
+| STOMP | 1.0–1.2 TCP; typed map-JSON input; no XML/object transformation | STOMP with Classic extensions and transformations | 1.0–1.2 |
+| AMQP | Partial: AMQP 1.0 TCP; Proton transactions and durable reconnect exercised | AMQP 1.0 | AMQP 1.0 |
+| MQTT | 3.1/3.1.1; retained replay on repeated SUBSCRIBE; no MQTT 5 | 3.1/3.1.1 | 3.1/3.1.1 and 5 |
+| Queues, topics, durable and temporary destinations | Implemented; temporary topic bridging unverified | Supported | Supported through address/queue and protocol mappings |
+| Selectors and destination routing | SQL-92 selectors, wildcard/composite destinations and virtual topics; no XPath | SQL-92, XPath, wildcard/composite and virtual destinations | SQL-style filters, wildcard addresses and configurable OpenWire virtual-topic mapping |
+| Transactions | Local and recoverable prepared XA; protocol-specific interoperability coverage | Local and XA | Local and XA |
+| Delayed/scheduled delivery | Classic delay/period/repeat/cron properties and scheduler management | Optional persistent scheduler, including cron/repeat | Scheduled delivery using `_AMQ_SCHED_DELIVERY`; different scheduling model |
+| Expiry, DLQ, groups and exclusive consumers | Implemented in core | Supported | Supported |
+| Persistence | Sled or memory; no KahaDB file compatibility | KahaDB default; JDBC option | File journal default; JDBC option |
+| Authentication / authorization | Basic users, passwords/digests and destination/group rules; no JAAS/plugin parity | Simple authentication, JAAS and authorization plugins | JAAS/custom security managers and role permissions |
+| Administration / logging | Rust web console, JSON API, structured text/JSON/file logging; no JMX | Web console, JMX/Jolokia and Java logging | Web console, JMX/Jolokia, management API and Java logging |
+| Broker networking | Partial: OpenWire static/demand, duplex, conduit/non-conduit, TTL/exclusions, temp queue proxies, selected advisories and reconnect | Networks of brokers, duplex, conduit options and discovery | Core bridges, clustering and federation; not identical to Classic networks |
+| Bridge delivery guarantee | At-least-once; response loss can duplicate forwarding | Depends on bridge, failover and persistence configuration; not a universal distributed transaction | Bridges support reconnect and configurable duplicate detection |
+| TLS / WebSocket | Unsupported natively; trusted network or external TLS termination required | Supported transports | Supported transports |
+| Discovery, HA and replication | Unsupported; reconnecting a connector is not broker HA | Discovery and shared-store/shared-filesystem or JDBC master/slave configurations | Discovery, shared-store HA and replication |
+| Performance comparison | Not benchmarked; no superiority claim | Established production broker | Established production broker |
+
+Apache sources: [Classic protocols][classic-protocols], [MQTT][classic-mqtt],
+[networks of brokers][classic-networks], [KahaDB][classic-kahadb],
+[master/slave][classic-ha]; Artemis [protocol interoperability][artemis-protocols],
+[OpenWire][artemis-openwire], [persistence][artemis-persistence],
+[HA][artemis-ha], [bridges][artemis-bridges],
+[scheduling][artemis-scheduling], [security][artemis-security],
+[management][artemis-management] and [transports][artemis-transports].
+
+[classic-protocols]: https://activemq.apache.org/components/classic/documentation/protocols
+[classic-mqtt]: https://activemq.apache.org/components/classic/documentation/mqtt
+[classic-networks]: https://activemq.apache.org/components/classic/documentation/networks-of-brokers
+[classic-kahadb]: https://activemq.apache.org/components/classic/documentation/kahadb
+[classic-ha]: https://activemq.apache.org/components/classic/documentation/masterslave
+[artemis-protocols]: https://activemq.apache.org/components/artemis/documentation/latest/protocols-interoperability.html
+[artemis-openwire]: https://activemq.apache.org/components/artemis/documentation/latest/openwire.html
+[artemis-persistence]: https://activemq.apache.org/components/artemis/documentation/latest/persistence.html
+[artemis-ha]: https://activemq.apache.org/components/artemis/documentation/latest/ha.html
+[artemis-bridges]: https://activemq.apache.org/components/artemis/documentation/latest/core-bridges.html
+[artemis-scheduling]: https://activemq.apache.org/components/artemis/documentation/latest/scheduled-messages.html
+[artemis-security]: https://activemq.apache.org/components/artemis/documentation/latest/security.html
+[artemis-management]: https://activemq.apache.org/components/artemis/documentation/latest/management.html
+[artemis-transports]: https://activemq.apache.org/components/artemis/documentation/latest/configuring-transports.html
 
 ## Build and run
 
@@ -104,8 +159,12 @@ appropriate TLS termination.
 
 ## Known compatibility limits
 
-- OpenWire negotiation advertises up to version 12, but v1–v11 layouts are
-  not independently verified. Not all Classic commands/advisories are covered.
+- OpenWire negotiates v4–v12 with tight encoding and caches disabled. The
+  ActiveMQ 6.2.6 Java client passes queue, selector, topic and transaction
+  commit/rollback checks at each supported version, including a small producer
+  window. Versions 1–3 are explicitly rejected. Lifecycle advisories preserve
+  connection, producer, consumer, destination and removal payloads, but not
+  every Classic command/advisory or transport option is implemented.
 - STOMP `transformation:jms-map-json` SEND frames without `content-length`
   decode Classic typed map entries or plain scalar JSON objects into native
   map bodies. Invalid transformations return an ERROR frame; arbitrary object
@@ -116,11 +175,18 @@ appropriate TLS termination.
   durable queue and outstanding packet identifiers. MQTT's optional packet
   journal and core store are not an atomic persistence domain;
   a crash at that boundary can duplicate QoS 2 routing.
-- Network connectors require separate reverse connectors instead of duplex.
-  Non-conduit subscriptions, temporary-destination forwarding and advisory
-  payload forwarding are unsupported. Established-connection restart recovery
-  has not been independently verified. Forwarding is not an atomic distributed
-  transaction; loss of a remote response can cause duplicates on retry.
+- Network connectors support duplex and non-conduit subscriptions; temporary
+  queue proxies follow live demand and are deleted when that demand disappears.
+  Queue/topic forwarding and temporary request/reply in both directions have
+  been exercised against stock Classic 6.2.6. Temporary topic bridging remains
+  unverified. Restart recovery after an established connection is covered by
+  Rust broker integration tests, not a stock Classic crash/restart test.
+  Advisory payload forwarding requires explicit static inclusion. Consumer
+  advisory forwarding and dynamic advisory includes are rejected to prevent
+  fabricated network demand; static temporary destinations are unsupported.
+  Forwarding is not an atomic distributed transaction; loss of a remote
+  response can cause duplicates on retry. An idle duplex consumer is recycled
+  after 24 hours; this is not full Classic bridge/failover behavior.
 - TLS/WebSocket transports, discovery/multicast, JMX, XPath selectors,
   retroactive consumers and MQTT 5 are unsupported.
 - Complete Classic plugin, management, storage, clustering and failure-mode
@@ -137,6 +203,13 @@ cargo clippy --all-targets -- -D warnings
 Third-party client checks live under `tests/interop/`. Follow each harness's
 dependency/setup instructions. Core unit tests and protocol TCP tests run with
 `cargo test`.
+
+`tests/interop/openwire/run.sh` checks all supported versions (4–12) using an
+unmodified ActiveMQ 6.2.6 Java client. Pass a version or inclusive version range
+to narrow the run. `tests/interop/network/ClassicPeer.java` provides a stock
+Classic peer and bidirectional queue/topic/temporary-reply checks; configure
+duplex demand includes for `queue://interop.>`, `topic://interop.>` and
+`temp-queue://>` when running that harness.
 
 To check STOMP map JSON against an unmodified Java JMS client, set
 `AMQ_CLASSPATH` to the ActiveMQ 6.2.6 client and its runtime dependency jars,

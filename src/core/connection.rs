@@ -247,6 +247,19 @@ impl BrokerCore {
             )));
         }
         let mut inner = self.lock();
+        let state = inner
+            .connections
+            .get(&connection)
+            .ok_or_else(|| CoreError::IllegalState("connection is closed".to_owned()))?;
+        if inner.temps.contains(&destination) {
+            return if state.temps.contains(&destination) {
+                Ok(())
+            } else {
+                Err(CoreError::InvalidDestination(format!(
+                    "temporary destination {destination} is owned by another connection"
+                )))
+            };
+        }
         let Some(state) = inner.connections.get_mut(&connection) else {
             return Err(CoreError::IllegalState("connection is closed".to_owned()));
         };

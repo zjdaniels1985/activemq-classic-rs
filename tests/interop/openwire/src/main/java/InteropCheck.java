@@ -17,7 +17,8 @@ public final class InteropCheck {
         int last = args.length < 2 ? (args.length == 0 ? 12 : first) : Integer.parseInt(args[1]);
         for (int version = first; version <= last; version++) {
             runVersion(version);
-            System.out.println("OpenWire v" + version + ": queue, selector, topic, transaction OK");
+            System.out.println("OpenWire v" + version
+                    + ": queue, selector, topic, transaction, producer window OK");
         }
     }
 
@@ -35,19 +36,15 @@ public final class InteropCheck {
 
             TextMessage rolledBack = session.createTextMessage("must not be visible");
             rolledBack.setStringProperty("marker", "match");
-            System.out.println("v" + version + ": sending rollback message");
             producer.send(rolledBack);
-            System.out.println("v" + version + ": rolling back");
             session.rollback();
 
             TextMessage queued = session.createTextMessage("queue-v" + version);
             queued.setStringProperty("marker", "match");
-            System.out.println("v" + version + ": sending committed message");
             producer.send(queued);
             TextMessage skipped = session.createTextMessage("selector mismatch");
             skipped.setStringProperty("marker", "skip");
             producer.send(skipped);
-            System.out.println("v" + version + ": committing");
             session.commit();
 
             connection.start();

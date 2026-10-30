@@ -445,8 +445,14 @@ async fn process_command(
                 })?;
             let incoming_tx = incoming.tx.clone();
             let producer_id = incoming.producer_id.clone();
-            let message_size =
-                i32::try_from(frame.payload.len().saturating_add(5)).unwrap_or(i32::MAX);
+            // Producer windows count Classic's message memory estimate, not
+            // the number of encoded bytes on the socket.
+            let message_size = i32::try_from(
+                1024usize
+                    .saturating_add(incoming.properties.len())
+                    .saturating_add(incoming.body.len()),
+            )
+            .unwrap_or(i32::MAX);
             tracing::debug!(properties_len=incoming.properties.len(), properties=?incoming.properties, "decoded OpenWire property bytes");
             let Some(conn) = *connection else {
                 return send_protocol_error(
