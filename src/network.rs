@@ -13,7 +13,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::sync::{mpsc, oneshot};
 
 use crate::config::NetworkConnectorConfig;
 use crate::core::{
@@ -162,6 +164,7 @@ async fn connect_and_run(
         acknowledge_advisory,
         advisory_tx,
     )));
+    let mut sender = Forwarder::connect(&address, config).await?;
 
     let broker_info = core.info();
     let local_broker_id = broker_info.id;
@@ -255,6 +258,9 @@ async fn connect_and_run(
 
     loop {
         tokio::select! {
+            failure = sender.failures.recv() => {
+                return Err(failure.unwrap_or_else(|| "remote forwarding worker stopped".into()));
+            }
             action = remote_advisories.recv() => {
                 let action = match action {
                     Some(Ok(action)) => action,
@@ -340,15 +346,24 @@ async fn connect_and_run(
             event = events.recv() => {
                 match event {
                     Some(Event::Deliver(delivery)) => {
-                        let ack = |core: &BrokerCore| {
-                            core.ack(
-                                connection,
-                                delivery.consumer,
-                                Acks::Deliveries(vec![delivery.delivery_id]),
-                                AckOp::Consumed,
-                                None,
-                            )
-                            .map_err(|error| error.to_string())
+                        let ack = || {
+                            let core = Arc::clone(&core);
+                            let consumer = delivery.consumer;
+                            let delivery_id = delivery.delivery_id;
+                            async move {
+                                tokio::task::spawn_blocking(move || {
+                                    core.ack(
+                                        connection,
+                                        consumer,
+                                        Acks::Deliveries(vec![delivery_id]),
+                                        AckOp::Consumed,
+                                        None,
+                                    )
+                                    .map_err(|error| error.to_string())
+                                })
+                                .await
+                                .map_err(|error| error.to_string())?
+                            }
                         };
                         if delivery.consumer == observer {
                             match delivery.message.advisory.as_ref() {
@@ -388,7 +403,7 @@ async fn connect_and_run(
                                 }
                                 _ => {}
                             }
-                            ack(&core)?;
+                            ack().await?;
                             continue;
                         }
                         let mut message = (*delivery.message).clone();
@@ -400,18 +415,18 @@ async fn connect_and_run(
                                 destination = %message.destination,
                                 "advisory message not forwarded; advisory topics must be statically included by name"
                             );
-                            ack(&core)?;
+                            ack().await?;
                             continue;
                         }
                         if message.broker_path.contains(&local_broker_id) {
-                            ack(&core)?;
+                            ack().await?;
                             continue;
                         }
                         message.broker_path.push(local_broker_id.clone());
-                        send_and_confirm(&address, config, &message)
+                        sender.send_and_confirm(message)
                             .await
                             .map_err(|error| format!("remote send failed: {error}"))?;
-                        ack(&core)?;
+                        ack().await?;
                     }
                     Some(Event::ConnectionClosed { reason }) => return Err(reason),
                     Some(Event::ConsumerClosed { consumer, .. }) => {
@@ -626,7 +641,10 @@ async fn run_duplex_consumer(
                     .push(remote_broker_id.clone().unwrap_or_else(|| local_broker_id.clone()));
                 // At-least-once: the remote dispatch is acknowledged only
                 // after the local broker accepted the message.
-                core.send(connection, message, None)
+                let core = Arc::clone(&core);
+                tokio::task::spawn_blocking(move || core.send(connection, message, None))
+                    .await
+                    .map_err(|error| error.to_string())?
                     .map_err(|error| format!("local send failed: {error}"))?;
             }
             client
@@ -641,49 +659,210 @@ async fn run_duplex_consumer(
     }
 }
 
-async fn send_and_confirm(
-    address: &str,
-    config: &NetworkConnectorConfig,
-    message: &Message,
-) -> Result<(), String> {
-    let mut client = OpenWireClient::connect_client(
-        address,
-        DEFAULT_MAX_FRAME_SIZE,
-        None,
-        config.username.as_deref(),
-        config.password.as_deref(),
-    )
-    .await
-    .map_err(|error| error.to_string())?;
-    let producer = client
-        .create_producer(None)
-        .await
-        .map_err(|error| error.to_string())?;
-    let command_id = client.next_command_id();
-    let mut frame = openwire::encode_client_message(&producer, message, command_id);
-    // Loose-encoded command header: CommandId (i32) then responseRequired.
-    frame.payload[4] = 1;
-    client
-        .send_command(&frame)
-        .await
-        .map_err(|error| error.to_string())?;
-    loop {
-        let response = tokio::time::timeout(Duration::from_secs(30), client.receive())
+struct ForwardRequest {
+    message: Message,
+    confirmed: oneshot::Sender<Result<(), String>>,
+}
+
+/// A bounded handoff keeps the remote socket driver independent from local
+/// durable acknowledgements. No detached retry can acknowledge a failed send.
+struct Forwarder {
+    requests: mpsc::Sender<ForwardRequest>,
+    failures: mpsc::Receiver<String>,
+    _worker: AbortOnDrop,
+}
+
+impl Forwarder {
+    async fn connect(address: &str, config: &NetworkConnectorConfig) -> Result<Self, String> {
+        let mut sender = ForwardSender::connect(address, config).await?;
+        let (requests, mut pending) = mpsc::channel::<ForwardRequest>(1);
+        let (failures, receiver) = mpsc::channel(1);
+        let worker = AbortOnDrop(tokio::spawn(async move {
+            let error = loop {
+                tokio::select! {
+                    request = pending.recv() => {
+                        let Some(request) = request else { return };
+                        let result = sender.send_and_confirm(&request.message).await;
+                        let error = result.as_ref().err().cloned();
+                        let _ = request.confirmed.send(result);
+                        if let Some(error) = error {
+                            break error;
+                        }
+                    }
+                    response = sender.responses.recv() => {
+                        match response {
+                            Some(Ok(_)) => {}
+                            Some(Err(error)) => break error,
+                            None => break "remote forwarding reader stopped".into(),
+                        }
+                    }
+                    _ = sender.heartbeat.tick() => {
+                        if let Err(error) = sender.send_heartbeat().await {
+                            break error;
+                        }
+                    }
+                }
+            };
+            let _ = failures.send(error).await;
+        }));
+        Ok(Self {
+            requests,
+            failures: receiver,
+            _worker: worker,
+        })
+    }
+
+    async fn send_and_confirm(&self, message: Message) -> Result<(), String> {
+        let (confirmed, result) = oneshot::channel();
+        self.requests
+            .send(ForwardRequest { message, confirmed })
             .await
-            .map_err(|_| "timed out waiting for remote send response".to_owned())?
+            .map_err(|_| "remote forwarding worker stopped".to_owned())?;
+        result
+            .await
+            .map_err(|_| "remote forwarding worker stopped before confirmation".to_owned())?
+    }
+}
+
+/// One anonymous producer and one outstanding send per connector. Awaiting
+/// confirmation before consuming the next local delivery preserves source
+/// prefetch backpressure and never acknowledges an unconfirmed remote send.
+struct ForwardSender {
+    writer: OwnedWriteHalf,
+    producer: openwire::WireId,
+    next_command_id: i32,
+    responses: mpsc::Receiver<Result<OpenWireFrame, String>>,
+    heartbeat: tokio::time::Interval,
+    _reader: AbortOnDrop,
+}
+
+impl ForwardSender {
+    async fn connect(address: &str, config: &NetworkConnectorConfig) -> Result<Self, String> {
+        let (mut client, producer) = tokio::time::timeout(Duration::from_secs(30), async {
+            let mut client = OpenWireClient::connect_client(
+                address,
+                DEFAULT_MAX_FRAME_SIZE,
+                None,
+                config.username.as_deref(),
+                config.password.as_deref(),
+            )
+            .await?;
+            let producer = client.create_producer(None).await?;
+            Ok::<_, openwire::OpenWireError>((client, producer))
+        })
+        .await
+        .map_err(|_| "timed out establishing remote forwarding connection".to_owned())?
+        .map_err(|error| error.to_string())?;
+        let next_command_id = client.next_command_id();
+        let (reader, writer) = client.into_parts();
+        let (responses, receiver) = mpsc::channel(16);
+        let reader = AbortOnDrop(tokio::spawn(read_forward_responses(reader, responses)));
+        let mut heartbeat = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(10),
+            Duration::from_secs(10),
+        );
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        Ok(Self {
+            writer,
+            producer,
+            next_command_id,
+            responses: receiver,
+            heartbeat,
+            _reader: reader,
+        })
+    }
+
+    async fn write(&mut self, frame: &OpenWireFrame) -> Result<(), String> {
+        let mut bytes = Vec::new();
+        frame
+            .write_to(&mut bytes, DEFAULT_MAX_FRAME_SIZE)
             .map_err(|error| error.to_string())?;
-        match response.command_type {
-            30 if response.payload.get(5..9) == Some(command_id.to_be_bytes().as_slice()) => {
-                return Ok(());
+        tokio::time::timeout(Duration::from_secs(30), self.writer.write_all(&bytes))
+            .await
+            .map_err(|_| "timed out writing to remote forwarding connection".to_owned())?
+            .map_err(|error| error.to_string())
+    }
+
+    async fn send_heartbeat(&mut self) -> Result<(), String> {
+        self.write(&OpenWireFrame {
+            command_type: 10,
+            payload: vec![0; 5],
+        })
+        .await
+    }
+
+    async fn send_and_confirm(&mut self, message: &Message) -> Result<(), String> {
+        let command_id = self.next_command_id;
+        self.next_command_id = self.next_command_id.wrapping_add(1);
+        let mut frame = openwire::encode_client_message(&self.producer, message, command_id);
+        // Loose-encoded command header: CommandId (i32) then responseRequired.
+        frame.payload[4] = 1;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            self.write(&frame).await?;
+            loop {
+                tokio::select! {
+                    response = self.responses.recv() => {
+                        let response = response
+                            .ok_or_else(|| "remote forwarding reader stopped".to_owned())??;
+                        if response.payload.get(5..9)
+                            != Some(command_id.to_be_bytes().as_slice())
+                        {
+                            continue;
+                        }
+                        match response.command_type {
+                            30 => return Ok(()),
+                            31 => return Err(decode_remote_exception(&response.payload)),
+                            _ => {}
+                        }
+                    }
+                    _ = self.heartbeat.tick() => self.send_heartbeat().await?,
+                }
             }
-            31 if response.payload.get(5..9) == Some(command_id.to_be_bytes().as_slice()) => {
-                return Err(decode_remote_exception(&response.payload));
+        })
+        .await
+        .map_err(|_| "timed out waiting for remote send response".to_owned())?
+    }
+}
+
+async fn read_forward_responses(
+    mut reader: OwnedReadHalf,
+    responses: mpsc::Sender<Result<OpenWireFrame, String>>,
+) {
+    // Never race a socket read with timers or outbound work: a partial frame
+    // must finish before the next read begins. Aborting this task also drops
+    // the connection; a cancelled read is never resumed on a reused socket.
+    let result = async {
+        loop {
+            let size = reader.read_u32().await.map_err(|error| error.to_string())? as usize;
+            if size == 0 || size > DEFAULT_MAX_FRAME_SIZE {
+                return Err("invalid remote forwarding frame length".to_owned());
             }
-            _ => tracing::debug!(
-                command_type = response.command_type,
-                "ignoring unrelated OpenWire response on bridge sender"
-            ),
+            let mut bytes = vec![0; size];
+            reader
+                .read_exact(&mut bytes)
+                .await
+                .map_err(|error| error.to_string())?;
+            match bytes[0] {
+                30 | 31 => {
+                    if responses
+                        .send(Ok(OpenWireFrame {
+                            command_type: bytes[0],
+                            payload: bytes[1..].to_vec(),
+                        }))
+                        .await
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                }
+                11 | 16 => return Err("remote forwarding connection closed".to_owned()),
+                _ => {}
+            }
         }
+    }
+    .await;
+    if let Err(error) = result {
+        let _ = responses.send(Err(error)).await;
     }
 }
 
@@ -1212,6 +1391,93 @@ impl<'a> WireReader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reusable_sender_correlates_fragmented_responses_across_heartbeats() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (client, accepted) = tokio::join!(
+            tokio::net::TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept(),
+        );
+        let client = client.unwrap();
+        client.set_nodelay(true).unwrap();
+        let (mut peer, _) = accepted.unwrap();
+        peer.set_nodelay(true).unwrap();
+        let (reader, writer) = client.into_split();
+        let (responses, receiver) = mpsc::channel(16);
+        let mut sender = ForwardSender {
+            writer,
+            producer: openwire::WireId {
+                connection: "test-forwarder".into(),
+                session: 1,
+                value: 1,
+            },
+            next_command_id: 7,
+            responses: receiver,
+            heartbeat: tokio::time::interval(Duration::from_millis(1)),
+            _reader: AbortOnDrop(tokio::spawn(read_forward_responses(reader, responses))),
+        };
+        let peer_task = tokio::spawn(async move {
+            let mut heartbeat_count = 0;
+            for command_id in [7i32, 8] {
+                loop {
+                    let size = peer.read_u32().await.unwrap();
+                    let mut bytes = vec![0; size as usize];
+                    peer.read_exact(&mut bytes).await.unwrap();
+                    if bytes[0] == 10 {
+                        heartbeat_count += 1;
+                        continue;
+                    }
+                    assert_eq!(&bytes[1..5], &command_id.to_be_bytes());
+                    assert_eq!(bytes[5], 1, "each message requires a broker response");
+                    break;
+                }
+                if command_id == 7 {
+                    let mut unrelated = vec![0; 5];
+                    unrelated.extend_from_slice(&8i32.to_be_bytes());
+                    unrelated.push(0);
+                    let mut bytes = Vec::new();
+                    OpenWireFrame {
+                        command_type: 31,
+                        payload: unrelated,
+                    }
+                    .write_to(&mut bytes, DEFAULT_MAX_FRAME_SIZE)
+                    .unwrap();
+                    peer.write_all(&bytes).await.unwrap();
+                }
+                let mut payload = vec![0; 5];
+                payload.extend_from_slice(&command_id.to_be_bytes());
+                if command_id == 8 {
+                    payload.push(0);
+                }
+                let mut bytes = Vec::new();
+                OpenWireFrame {
+                    command_type: if command_id == 7 { 30 } else { 31 },
+                    payload,
+                }
+                .write_to(&mut bytes, DEFAULT_MAX_FRAME_SIZE)
+                .unwrap();
+                // Both the length prefix and frame body cross heartbeat ticks.
+                for chunk in bytes.chunks(2) {
+                    peer.write_all(chunk).await.unwrap();
+                    tokio::time::sleep(Duration::from_millis(3)).await;
+                }
+            }
+            assert!(
+                heartbeat_count > 0,
+                "sender must heartbeat while awaiting a response"
+            );
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let message = Message::text(Destination::queue("test"), "body");
+            sender.send_and_confirm(&message).await.unwrap();
+            let error = sender.send_and_confirm(&message).await.unwrap_err();
+            assert!(error.contains("rejected"), "{error}");
+            peer_task.await.unwrap();
+        })
+        .await
+        .expect("fragmented responses or heartbeat writes stalled");
+    }
 
     #[test]
     fn destination_filters_honor_wildcards_and_exclusions() {

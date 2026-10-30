@@ -14,6 +14,7 @@ use serde::Deserialize;
 
 use crate::core::Policy;
 use crate::core::security::SecurityConfig;
+use crate::core::store::StoreOptions;
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -48,6 +49,7 @@ impl AppConfig {
                 self.persistence.backend
             )));
         }
+        self.persistence.group_commit.validate()?;
         if self.broker.max_frame_size == 0 || self.broker.max_frame_size > i32::MAX as usize {
             return Err(invalid(
                 "broker.max_frame_size must be between 1 and i32::MAX",
@@ -190,6 +192,7 @@ pub struct PersistenceConfig {
     /// `sled` (default) or `memory`.
     pub backend: String,
     pub path: String,
+    pub group_commit: StoreOptions,
 }
 
 impl Default for PersistenceConfig {
@@ -197,6 +200,7 @@ impl Default for PersistenceConfig {
         Self {
             backend: "sled".to_owned(),
             path: "./data/sled".to_owned(),
+            group_commit: StoreOptions::default(),
         }
     }
 }
@@ -353,6 +357,23 @@ mod tests {
     fn parses_shipped_configuration() {
         let config = AppConfig::parse(include_str!("../activemq-rust.toml")).unwrap();
         assert!(config.protocols.openwire.enabled);
+    }
+
+    #[test]
+    fn validates_group_commit_limits_and_zero_delay() {
+        for field in [
+            "queue_capacity",
+            "max_batch_operations",
+            "max_batch_bytes",
+            "max_pending_bytes",
+        ] {
+            assert!(
+                AppConfig::parse(&format!("[persistence.group_commit]\n{field} = 0\n")).is_err()
+            );
+        }
+        assert!(AppConfig::parse("[persistence.group_commit]\nmax_delay_us = 1000001\n").is_err());
+        let config = AppConfig::parse("[persistence.group_commit]\nmax_delay_us = 0\n").unwrap();
+        assert_eq!(config.persistence.group_commit.max_delay_us, 0);
     }
 
     #[test]

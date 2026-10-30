@@ -23,7 +23,7 @@ impl BrokerCore {
         connection: ConnectionId,
         consumer: ConsumerId,
     ) -> Result<(), CoreError> {
-        let mut inner = self.lock();
+        let mut inner = self.write_lock()?;
         let principal = inner.principal(connection)?;
         let state = inner
             .consumers
@@ -61,7 +61,7 @@ impl BrokerCore {
                 }
             }
         }
-        self.flush_batch(&mut inner)
+        self.flush_batch(inner)
     }
 
     pub(crate) fn advisory_message(&self, topic: Destination, data: AdvisoryData) -> Message {
@@ -110,10 +110,10 @@ impl BrokerCore {
         connection: ConnectionId,
         options: ConsumerOptions,
     ) -> Result<ConsumerId, CoreError> {
-        let mut inner = self.lock();
-        let principal = inner.principal(connection)?;
         let selector = parse_optional(options.selector.as_deref())
             .map_err(|error| CoreError::InvalidSelector(error.to_string()))?;
+        let mut inner = self.write_lock()?;
+        let principal = inner.principal(connection)?;
         let destination = options.destination.clone();
         self.check_access(&inner, &principal, &destination, Permission::Read)?;
         for component in destination.components() {
@@ -180,6 +180,7 @@ impl BrokerCore {
                 );
             }
             inner.emit(connection, Event::BrowseDone { consumer: id });
+            self.flush_batch(inner)?;
             return Ok(id);
         }
 
@@ -239,8 +240,8 @@ impl BrokerCore {
             }
             let created = !inner.durables.contains_key(&durable);
             if created {
-                if let Some(store) = &self.store {
-                    store.put_durable(&record)?;
+                if self.store.is_some() {
+                    inner.batch.put_durable(&record)?;
                 }
                 inner.durables.insert(durable.clone(), record);
                 inner.queues.insert(
@@ -304,7 +305,7 @@ impl BrokerCore {
         for key in &keys {
             self.dispatch(&mut inner, key);
         }
-        self.flush_batch(&mut inner)?;
+        self.flush_batch(inner)?;
         Ok(id)
     }
 
@@ -364,7 +365,7 @@ impl BrokerCore {
     pub fn close_consumer(&self, consumer: ConsumerId) {
         let mut inner = self.lock();
         self.close_consumer_locked(&mut inner, consumer);
-        if let Err(error) = self.flush_batch(&mut inner) {
+        if let Err(error) = self.flush_batch(inner) {
             tracing::warn!(%error, "failed to persist consumer close");
         }
     }
@@ -645,7 +646,7 @@ impl BrokerCore {
         op: AckOp,
         tx: Option<&TxId>,
     ) -> Result<(), CoreError> {
-        let mut inner = self.lock();
+        let mut inner = self.write_lock()?;
         let Some(state) = inner.consumers.get(&consumer) else {
             return Ok(());
         };
@@ -713,7 +714,7 @@ impl BrokerCore {
         for key in &queues {
             self.dispatch(&mut inner, key);
         }
-        self.flush_batch(&mut inner)
+        self.flush_batch(inner)
     }
 
     /// Removes a consumed message from its queue statistics and the store.
@@ -750,7 +751,7 @@ impl BrokerCore {
             let connection = state.connection;
             inner.emit(connection, Event::PullEmpty { consumer });
         }
-        let _ = self.flush_batch(&mut inner);
+        let _ = self.flush_batch(inner);
     }
 
     /// Sets the absolute link credit of a credit-mode consumer.
@@ -764,7 +765,7 @@ impl BrokerCore {
         for key in &queues {
             self.dispatch(&mut inner, key);
         }
-        let _ = self.flush_batch(&mut inner);
+        let _ = self.flush_batch(inner);
     }
 
     /// Dispatches what is available, then discards the remaining credit.
@@ -782,19 +783,19 @@ impl BrokerCore {
             let connection = state.connection;
             inner.emit(connection, Event::Drained { consumer, credit });
         }
-        let _ = self.flush_batch(&mut inner);
+        let _ = self.flush_batch(inner);
     }
 
     /// Deletes a durable subscription of the connection's client id.
     pub fn remove_durable(&self, connection: ConnectionId, name: &str) -> Result<(), CoreError> {
-        let mut inner = self.lock();
+        let mut inner = self.write_lock()?;
         let client_id = inner
             .connections
             .get(&connection)
             .and_then(|c| c.info.client_id.clone())
             .ok_or_else(|| CoreError::IllegalState("a client id is required".to_owned()))?;
         self.remove_durable_locked(&mut inner, &client_id, name)?;
-        self.flush_batch(&mut inner)
+        self.flush_batch(inner)
     }
 
     pub(crate) fn remove_durable_locked(
@@ -835,8 +836,8 @@ impl BrokerCore {
             }
         }
         inner.durables.remove(durable);
-        if let Some(store) = &self.store {
-            store.remove_durable(&durable.0, &durable.1)?;
+        if self.store.is_some() {
+            inner.batch.remove_durable(&durable.0, &durable.1);
         }
         Ok(())
     }

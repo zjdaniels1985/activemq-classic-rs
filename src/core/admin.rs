@@ -4,10 +4,11 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
-use super::broker::BrokerCore;
+use super::broker::{BrokerCore, LockMetrics};
 use super::destination::Destination;
 use super::message::{Message, now_millis};
 use super::queue::{QueueKind, durable_key, queue_key};
+use super::store::StoreMetrics;
 use super::types::{
     ConnectionId, ConnectionStats, ConsumerStats, CoreError, DestinationStats, Event, JobStats,
     MessageView, SubscriptionStats,
@@ -28,10 +29,14 @@ pub struct BrokerInfo {
     pub store_size_bytes: u64,
     pub persistent: bool,
     pub time: i64,
+    pub state_lock: LockMetrics,
+    pub storage: Option<StoreMetrics>,
 }
 
 impl BrokerCore {
     pub fn info(&self) -> BrokerInfo {
+        // Filesystem accounting can block; never do it under the state mutex.
+        let store_size_bytes = self.store.as_ref().map_or(0, |s| s.size_on_disk());
         let inner = self.lock();
         BrokerInfo {
             name: self.broker_name().to_owned(),
@@ -48,9 +53,11 @@ impl BrokerCore {
             durable_subscriptions: inner.durables.len(),
             scheduled_jobs: inner.jobs.len(),
             prepared_transactions: inner.transactions.values().filter(|t| t.prepared).count(),
-            store_size_bytes: self.store.as_ref().map_or(0, |s| s.size_on_disk()),
+            store_size_bytes,
             persistent: self.store.is_some(),
             time: now_millis(),
+            state_lock: self.lock_metrics(),
+            storage: self.store.as_ref().map(|store| store.metrics()),
         }
     }
 
@@ -178,9 +185,9 @@ impl BrokerCore {
     }
 
     pub fn delete_durable(&self, client_id: &str, name: &str) -> Result<(), CoreError> {
-        let mut inner = self.lock();
+        let mut inner = self.write_lock()?;
         self.remove_durable_locked(&mut inner, client_id, name)?;
-        self.flush_batch(&mut inner)
+        self.flush_batch(inner)
     }
 
     fn queue_keys_for(&self, destination: &Destination) -> Vec<String> {
@@ -234,7 +241,7 @@ impl BrokerCore {
     /// Removes every pending message. Returns the number removed.
     pub fn purge(&self, destination: &Destination) -> Result<usize, CoreError> {
         let keys = self.queue_keys_for(destination);
-        let mut inner = self.lock();
+        let mut inner = self.write_lock()?;
         let mut removed = 0;
         for key in keys {
             let Some(queue) = inner.queues.get_mut(&key) else {
@@ -249,30 +256,30 @@ impl BrokerCore {
                 }
             }
         }
-        self.flush_batch(&mut inner)?;
+        self.flush_batch(inner)?;
         tracing::info!(%destination, removed, "destination purged");
         Ok(removed)
     }
 
     pub fn create_destination(&self, destination: &Destination) -> Result<(), CoreError> {
-        let mut inner = self.lock();
+        let mut inner = self.write_lock()?;
         if destination.is_topic() {
             self.ensure_topic(&mut inner, destination);
         } else {
             self.ensure_queue(&mut inner, destination);
         }
-        self.flush_batch(&mut inner)
+        self.flush_batch(inner)
     }
 
     /// Deletes a queue or topic, closing its consumers.
     pub fn delete_destination(&self, destination: &Destination) -> Result<(), CoreError> {
-        let mut inner = self.lock();
+        let mut inner = self.write_lock()?;
         if !inner.destination_exists(destination) {
             return Err(CoreError::NotFound(format!("{destination} does not exist")));
         }
         if destination.is_temporary() {
             self.delete_temp_locked(&mut inner, destination);
-            return self.flush_batch(&mut inner);
+            return self.flush_batch(inner);
         }
         let consumers = inner
             .consumers
@@ -293,27 +300,47 @@ impl BrokerCore {
         if destination.is_queue() {
             let key = queue_key(destination);
             if let Some(queue) = inner.queues.remove(&key) {
+                for entry in queue.pending.values() {
+                    if entry.persisted {
+                        inner.batch.remove_message(&key, entry.seq);
+                    }
+                }
                 for consumer in &queue.consumers {
                     if let Some(c) = inner.consumers.get_mut(consumer) {
                         c.queues.retain(|k| *k != key);
                     }
                 }
             }
-            if let Some(store) = &self.store {
-                store.purge(&key)?;
+            let sequences = inner
+                .consumers
+                .values()
+                .flat_map(|consumer| consumer.in_flight.values())
+                .filter(|flight| flight.persisted && flight.queue == key)
+                .map(|flight| flight.seq)
+                .chain(
+                    inner
+                        .transactions
+                        .values()
+                        .flat_map(|tx| &tx.detached)
+                        .filter(|flight| flight.persisted && flight.queue == key)
+                        .map(|flight| flight.seq),
+                )
+                .collect::<Vec<_>>();
+            for sequence in sequences {
+                inner.batch.remove_message(&key, sequence);
             }
         } else {
             inner.topics.remove(&destination.name);
         }
-        if let Some(store) = &self.store {
-            store.remove_destination(destination)?;
+        if self.store.is_some() {
+            inner.batch.remove_destination(destination);
         }
         self.advise(
             &mut inner,
             destination.destination_advisory_topic(),
             super::message::AdvisoryData::DestinationRemoved(destination.clone()),
         );
-        self.flush_batch(&mut inner)?;
+        self.flush_batch(inner)?;
         tracing::info!(%destination, "destination deleted");
         Ok(())
     }
@@ -329,7 +356,7 @@ impl BrokerCore {
         id: &str,
     ) -> Result<Option<Message>, CoreError> {
         let key = queue_key(destination);
-        let mut inner = self.lock();
+        let mut inner = self.write_lock()?;
         let Some(queue) = inner.queues.get_mut(&key) else {
             return Err(CoreError::NotFound(format!("{destination} does not exist")));
         };
@@ -340,7 +367,7 @@ impl BrokerCore {
         if entry.persisted {
             inner.batch.remove_message(&key, entry.seq);
         }
-        self.flush_batch(&mut inner)?;
+        self.flush_batch(inner)?;
         Ok(Some((*entry.message).clone()))
     }
 
@@ -355,9 +382,9 @@ impl BrokerCore {
             return Ok(false);
         };
         message.destination = to.clone();
-        let mut inner = self.lock();
+        let mut inner = self.write_lock()?;
         self.route(&mut inner, message)?;
-        self.flush_batch(&mut inner)?;
+        self.flush_batch(inner)?;
         Ok(true)
     }
 
@@ -374,17 +401,17 @@ impl BrokerCore {
         message.destination = original;
         message.redelivery_counter = 0;
         message.properties.remove("dlqDeliveryFailureCause");
-        let mut inner = self.lock();
+        let mut inner = self.write_lock()?;
         self.route(&mut inner, message)?;
-        self.flush_batch(&mut inner)?;
+        self.flush_batch(inner)?;
         Ok(true)
     }
 
     /// Sends a message as the broker itself (bypassing authorization).
     pub fn admin_send(&self, message: Message) -> Result<(), CoreError> {
-        let mut inner = self.lock();
+        let mut inner = self.write_lock()?;
         let result = self.accept(&mut inner, message);
-        self.flush_batch(&mut inner)?;
+        self.flush_batch(inner)?;
         result
     }
 
@@ -408,8 +435,19 @@ impl BrokerCore {
     }
 
     pub fn remove_job(&self, id: &str) -> bool {
-        let mut inner = self.lock();
-        self.remove_job_locked(&mut inner, id)
+        let mut inner = match self.write_lock() {
+            Ok(inner) => inner,
+            Err(error) => {
+                tracing::error!(%error, "cannot remove scheduled job");
+                return false;
+            }
+        };
+        let removed = self.remove_job_locked(&mut inner, id);
+        if let Err(error) = self.flush_batch(inner) {
+            tracing::error!(%error, "failed to persist scheduled job removal");
+            return false;
+        }
+        removed
     }
 
     /// Forcibly closes a client connection.
@@ -425,7 +463,7 @@ impl BrokerCore {
             },
         );
         self.disconnect_locked(&mut inner, connection);
-        let _ = self.flush_batch(&mut inner);
+        let _ = self.flush_batch(inner);
         true
     }
 }

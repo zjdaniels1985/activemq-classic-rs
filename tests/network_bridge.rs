@@ -1,11 +1,100 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use activemq_classic_rs::config::{AppConfig, ListenerConfig, NetworkConnectorConfig};
 use activemq_classic_rs::core::security::{AuthorizationEntry, UserConfig};
 use activemq_classic_rs::core::{Body, Destination, Message};
 use activemq_classic_rs::protocols::openwire::{OpenWireClient, OpenWireFrame};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 static NETWORK_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct ForwardingProbe {
+    address: std::net::SocketAddr,
+    connections: Arc<AtomicUsize>,
+    producers: Arc<AtomicUsize>,
+    reject_messages: Arc<AtomicBool>,
+    rejected: Arc<tokio::sync::Notify>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ForwardingProbe {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl ForwardingProbe {
+    async fn start(remote: std::net::SocketAddr) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let producers = Arc::new(AtomicUsize::new(0));
+        let reject_messages = Arc::new(AtomicBool::new(false));
+        let rejected = Arc::new(tokio::sync::Notify::new());
+        let task = {
+            let connections = connections.clone();
+            let producers = producers.clone();
+            let reject_messages = reject_messages.clone();
+            let rejected = rejected.clone();
+            tokio::spawn(async move {
+                let mut tasks = tokio::task::JoinSet::new();
+                loop {
+                    tokio::select! {
+                        accepted = listener.accept() => {
+                            let (client, _) = accepted.unwrap();
+                            connections.fetch_add(1, Ordering::SeqCst);
+                            let producers = producers.clone();
+                            let reject_messages = reject_messages.clone();
+                            let rejected = rejected.clone();
+                            tasks.spawn(async move {
+                                let remote = tokio::net::TcpStream::connect(remote).await?;
+                                client.set_nodelay(true)?;
+                                remote.set_nodelay(true)?;
+                                let (mut client_read, mut client_write) = client.into_split();
+                                let (mut remote_read, mut remote_write) = remote.into_split();
+                                let outgoing = async {
+                                    loop {
+                                        let size = client_read.read_u32().await?;
+                                        assert!(size > 0 && size <= 100 * 1024 * 1024);
+                                        let mut bytes = vec![0; size as usize];
+                                        client_read.read_exact(&mut bytes).await?;
+                                        if bytes[0] == 6 {
+                                            producers.fetch_add(1, Ordering::SeqCst);
+                                        }
+                                        if (23..=29).contains(&bytes[0])
+                                            && reject_messages.load(Ordering::SeqCst)
+                                        {
+                                            rejected.notify_one();
+                                            return Err::<(), std::io::Error>(
+                                                std::io::ErrorKind::ConnectionReset.into(),
+                                            );
+                                        }
+                                        let mut frame = size.to_be_bytes().to_vec();
+                                        frame.extend_from_slice(&bytes);
+                                        remote_write.write_all(&frame).await?;
+                                    }
+                                };
+                                let incoming = tokio::io::copy(&mut remote_read, &mut client_write);
+                                tokio::try_join!(outgoing, incoming).map(|_| ())
+                            });
+                        }
+                        _ = tasks.join_next(), if !tasks.is_empty() => {}
+                    }
+                }
+            })
+        };
+        Self {
+            address,
+            connections,
+            producers,
+            reject_messages,
+            rejected,
+            task,
+        }
+    }
+}
 
 fn broker_config() -> AppConfig {
     let mut config = AppConfig::default();
@@ -111,6 +200,141 @@ async fn stopping_broker_closes_bridge_connections_and_consumers() {
 }
 
 #[tokio::test]
+async fn forwarding_many_messages_reuses_one_connection_and_producer() {
+    let _guard = NETWORK_TEST_LOCK.lock().await;
+    let remote = activemq_classic_rs::runtime::start(broker_config())
+        .await
+        .unwrap();
+    let probe = ForwardingProbe::start(remote.address("openwire").unwrap()).await;
+    let destination = Destination::queue("reuse.jobs");
+    let mut config = broker_config();
+    config.network_connectors.push(NetworkConnectorConfig {
+        name: "reuse".into(),
+        uris: vec![format!("tcp://{}", probe.address)],
+        static_included_destinations: vec![destination.to_uri()],
+        prefetch: 4,
+        reconnect_delay_ms: 100,
+        ..NetworkConnectorConfig::default()
+    });
+    let local = activemq_classic_rs::runtime::start(config).await.unwrap();
+    wait_for_network_consumer(&local, &destination, true, "reusable sender").await;
+    let mut local_client = connected(local.address("openwire").unwrap()).await;
+    let producer = local_client
+        .create_producer(Some(&destination))
+        .await
+        .unwrap();
+    let mut remote_client = connected(remote.address("openwire").unwrap()).await;
+    let consumer = remote_client
+        .create_consumer(&destination, 4, None)
+        .await
+        .unwrap();
+    for index in 0..64 {
+        local_client
+            .send(
+                &producer,
+                &Message::text(destination.clone(), format!("reuse-{index}")),
+            )
+            .await
+            .unwrap();
+    }
+    for index in 0..64 {
+        let message = expect_text(&mut remote_client, &format!("reuse-{index}")).await;
+        remote_client
+            .acknowledge(&consumer, &message.message_id)
+            .await
+            .unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let stats = local.core.destinations();
+            if stats.iter().any(|entry| {
+                entry.destination == destination && entry.pending == 0 && entry.in_flight == 0
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("confirmed forwards must be acknowledged locally");
+    assert_eq!(
+        probe.connections.load(Ordering::SeqCst),
+        2,
+        "one advisory and one sender connection"
+    );
+    assert_eq!(
+        probe.producers.load(Ordering::SeqCst),
+        1,
+        "one reusable anonymous producer"
+    );
+    assert_eq!(
+        remote
+            .core
+            .connections()
+            .iter()
+            .map(|connection| connection.producers)
+            .sum::<usize>(),
+        1
+    );
+    remote_client.remove_consumer(&consumer).await.unwrap();
+    local.stop();
+    remote.stop();
+}
+
+#[tokio::test]
+async fn failed_forward_is_redelivered_at_the_source_without_remote_acceptance() {
+    let _guard = NETWORK_TEST_LOCK.lock().await;
+    let remote = activemq_classic_rs::runtime::start(broker_config())
+        .await
+        .unwrap();
+    let probe = ForwardingProbe::start(remote.address("openwire").unwrap()).await;
+    let destination = Destination::queue("failure.jobs");
+    let mut config = broker_config();
+    config.network_connectors.push(NetworkConnectorConfig {
+        name: "failure".into(),
+        uris: vec![format!("tcp://{}", probe.address)],
+        static_included_destinations: vec![destination.to_uri()],
+        reconnect_delay_ms: 100,
+        ..NetworkConnectorConfig::default()
+    });
+    let local = activemq_classic_rs::runtime::start(config).await.unwrap();
+    wait_for_network_consumer(&local, &destination, true, "failure sender").await;
+    probe.reject_messages.store(true, Ordering::SeqCst);
+    let mut client = connected(local.address("openwire").unwrap()).await;
+    let message_id = send(&mut client, &destination, "must-redeliver").await;
+    tokio::time::timeout(Duration::from_secs(5), probe.rejected.notified())
+        .await
+        .expect("bridge did not attempt the failing send");
+    drop(probe);
+    wait_for_network_consumer(&local, &destination, false, "failed sender removed").await;
+    assert!(
+        remote.core.destinations().iter().all(|entry| {
+            entry.destination != destination || (entry.pending == 0 && entry.enqueued == 0)
+        }),
+        "the failed send must not reach the remote broker"
+    );
+    let consumer = client.create_consumer(&destination, 1, None).await.unwrap();
+    let (actual_consumer, message, redelivered) = client
+        .receive_message(Duration::from_secs(5))
+        .await
+        .unwrap()
+        .expect("unconfirmed forwarding must leave the source delivery recoverable");
+    assert_eq!(actual_consumer, consumer);
+    assert_eq!(message.message_id, message_id);
+    assert_eq!(message.body.as_ref(), &Body::Text("must-redeliver".into()));
+    assert!(
+        redelivered > 0,
+        "failed forwarding must be marked redelivered"
+    );
+    client
+        .acknowledge(&consumer, &message.message_id)
+        .await
+        .unwrap();
+    local.stop();
+    remote.stop();
+}
+
+#[tokio::test]
 async fn static_and_demand_queue_topic_bridges_apply_exclusions_and_keep_idle_queues_local() {
     let _guard = NETWORK_TEST_LOCK.lock().await;
     let remote = activemq_classic_rs::runtime::start(broker_config())
@@ -152,7 +376,7 @@ async fn static_and_demand_queue_topic_bridges_apply_exclusions_and_keep_idle_qu
         .unwrap()
         .unwrap();
     assert_eq!(received.0, static_consumer);
-    assert_eq!(received.1.body, Body::Text("static".into()));
+    assert_eq!(received.1.body.as_ref(), &Body::Text("static".into()));
     assert_eq!(
         received
             .1
@@ -179,7 +403,7 @@ async fn static_and_demand_queue_topic_bridges_apply_exclusions_and_keep_idle_qu
         .unwrap()
         .unwrap();
     assert_eq!(received.0, demand_consumer);
-    assert_eq!(received.1.body, Body::Text("demand".into()));
+    assert_eq!(received.1.body.as_ref(), &Body::Text("demand".into()));
     remote_client
         .acknowledge(&demand_consumer, &received.1.message_id)
         .await
@@ -198,7 +422,7 @@ async fn static_and_demand_queue_topic_bridges_apply_exclusions_and_keep_idle_qu
         .unwrap()
         .unwrap();
     assert_eq!(received.0, topic_consumer);
-    assert_eq!(received.1.body, Body::Text("topic".into()));
+    assert_eq!(received.1.body.as_ref(), &Body::Text("topic".into()));
     remote_client
         .acknowledge(&topic_consumer, &received.1.message_id)
         .await
@@ -460,7 +684,10 @@ async fn static_bridge_retries_until_remote_becomes_available() {
         .unwrap()
         .expect("message should be forwarded after reconnect");
     assert_eq!(received.0, remote_consumer);
-    assert_eq!(received.1.body, Body::Text("after-reconnect".into()));
+    assert_eq!(
+        received.1.body.as_ref(),
+        &Body::Text("after-reconnect".into())
+    );
 
     local.stop();
     remote.stop();
@@ -498,6 +725,21 @@ async fn bridge_reconnects_after_established_remote_broker_restarts() {
     })
     .await
     .expect("initial bridge connection was not established");
+    let destination = Destination::queue("restart.established");
+    let mut local_client = connected(local.address("openwire").unwrap()).await;
+    let mut first_remote_client = connected(remote_address).await;
+    first_remote_client
+        .create_consumer(&destination, 10, None)
+        .await
+        .unwrap();
+    send(
+        &mut local_client,
+        &destination,
+        "before-established-restart",
+    )
+    .await;
+    expect_text(&mut first_remote_client, "before-established-restart").await;
+    drop(first_remote_client);
     for connection in first_remote.core.connections() {
         first_remote.core.close_connection(connection.id);
     }
@@ -528,7 +770,6 @@ async fn bridge_reconnects_after_established_remote_broker_restarts() {
     })
     .await
     .expect("remote listener did not release its address for restart");
-    let destination = Destination::queue("restart.established");
     let mut remote_client = connected(remote_address).await;
     let remote_consumer = remote_client
         .create_consumer(&destination, 10, None)
@@ -548,7 +789,6 @@ async fn bridge_reconnects_after_established_remote_broker_restarts() {
     .await
     .expect("bridge did not reconnect to the restarted broker");
 
-    let mut local_client = connected(local.address("openwire").unwrap()).await;
     send(&mut local_client, &destination, "after-established-restart").await;
     let received = remote_client
         .receive_message(Duration::from_secs(5))
@@ -557,8 +797,8 @@ async fn bridge_reconnects_after_established_remote_broker_restarts() {
         .expect("message should pass through the re-established bridge");
     assert_eq!(received.0, remote_consumer);
     assert_eq!(
-        received.1.body,
-        Body::Text("after-established-restart".into())
+        received.1.body.as_ref(),
+        &Body::Text("after-established-restart".into())
     );
 
     local.stop();
@@ -618,7 +858,7 @@ async fn non_conduit_bridges_keep_one_local_consumer_per_remote_demand() {
         .unwrap()
         .expect("message should be forwarded to one remote consumer");
     assert!(received.0 == first || received.0 == second);
-    assert_eq!(received.1.body, Body::Text("non-conduit".into()));
+    assert_eq!(received.1.body.as_ref(), &Body::Text("non-conduit".into()));
 
     local.stop();
     remote.stop();
@@ -675,7 +915,10 @@ async fn remote_temporary_queue_is_proxied_and_cleaned_up_with_owner_lifecycle()
         .unwrap()
         .expect("temporary destination message was not forwarded");
     assert_eq!(received.0, remote_consumer);
-    assert_eq!(received.1.body, Body::Text("temporary-message".into()));
+    assert_eq!(
+        received.1.body.as_ref(),
+        &Body::Text("temporary-message".into())
+    );
 
     drop(remote_client);
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -723,7 +966,7 @@ async fn expect_text(client: &mut OpenWireClient, text: &str) -> Message {
         .await
         .unwrap()
         .unwrap_or_else(|| panic!("expected {text}"));
-    assert_eq!(message.body, Body::Text(text.into()));
+    assert_eq!(message.body.as_ref(), &Body::Text(text.into()));
     message
 }
 
@@ -1047,7 +1290,7 @@ async fn serve_one(service: &mut OpenWireClient, expected: &str, reply: &str) {
         .await
         .unwrap()
         .unwrap_or_else(|| panic!("service did not receive {expected}"));
-    assert_eq!(message.body, Body::Text(expected.into()));
+    assert_eq!(message.body.as_ref(), &Body::Text(expected.into()));
     service
         .acknowledge(&consumer, &message.message_id)
         .await

@@ -50,11 +50,12 @@ pub async fn start(config: AppConfig) -> io::Result<RunningBroker> {
     let security = SecurityManager::new(config.security.clone())
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
     let data_dir = config.data_dir();
-    let core = BrokerCore::open(
+    let core = BrokerCore::open_with_store_options(
         config.broker.name.clone(),
         data_dir.as_deref(),
         config.policy.clone(),
         security,
+        config.persistence.group_commit.clone(),
     )
     .map_err(|error| io::Error::other(error.message().to_owned()))?;
     tracing::info!(

@@ -73,6 +73,188 @@ fn temporary_destination_cannot_be_claimed_by_another_connection() {
     assert_eq!(texts(&deliveries(&mut received)), ["still owned"]);
 }
 
+#[test]
+fn shared_bodies_preserve_storage_encoding_and_copy_on_write() {
+    let mut message = Message::text(Destination::queue("q"), "original");
+    let copy = message.clone();
+    assert!(Arc::ptr_eq(&message.body, &copy.body));
+    assert_eq!(
+        bincode::serialize(&message.body).unwrap(),
+        bincode::serialize(&Body::Text("original".into())).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&message.body).unwrap(),
+        serde_json::to_value(Body::Text("original".into())).unwrap()
+    );
+    let Body::Text(text) = Arc::make_mut(&mut message.body) else {
+        unreachable!();
+    };
+    text.push_str(" changed");
+    assert_eq!(copy.text_body(), Some("original"));
+    assert_eq!(message.text_body(), Some("original changed"));
+}
+
+#[test]
+fn virtual_topic_fanout_shares_payload_not_destination_metadata() {
+    let core = core_with(no_advisories());
+    let (connection, mut receiver) = client(&core, None);
+    let destination = Destination::topic("VirtualTopic.shared");
+    core.subscribe(connection, opts(destination.clone()))
+        .unwrap();
+    let queue = Destination::queue("Consumer.A.VirtualTopic.shared");
+    core.subscribe(connection, opts(queue.clone())).unwrap();
+    let message = Message::bytes(destination.clone(), vec![7; 1024 * 1024]);
+    let body = Arc::clone(&message.body);
+    core.send(connection, message, None).unwrap();
+    let delivered = deliveries(&mut receiver);
+    assert_eq!(delivered.len(), 2);
+    assert!(
+        delivered
+            .iter()
+            .all(|delivery| Arc::ptr_eq(&body, &delivery.message.body))
+    );
+    assert!(
+        delivered
+            .iter()
+            .any(|delivery| delivery.message.destination == queue)
+    );
+    assert!(
+        delivered
+            .iter()
+            .any(|delivery| delivery.message.destination == destination)
+    );
+}
+
+#[test]
+fn disk_flush_does_not_hold_state_lock_or_publish_early_deliveries() {
+    let path = super::store::tests::temp_path("flush-order");
+    let core = BrokerCore::open(
+        "flush-order",
+        Some(&path),
+        no_advisories(),
+        SecurityManager::disabled(),
+    )
+    .unwrap();
+    let (connection, mut receiver) = client(&core, None);
+    let destination = Destination::queue("flush-order");
+    core.subscribe(connection, opts(destination.clone()))
+        .unwrap();
+    let (entered, resume) = core.store.as_ref().unwrap().pause_next_flush();
+    let sender = Arc::clone(&core);
+    let sending = std::thread::spawn(move || {
+        sender.send(connection, Message::text(destination, "durable"), None)
+    });
+    entered.recv_timeout(Duration::from_secs(3)).unwrap();
+    let (progress_tx, progress_rx) = std::sync::mpsc::sync_channel(1);
+    let reader = Arc::clone(&core);
+    let reading = std::thread::spawn(move || {
+        progress_tx.send(reader.destinations()).unwrap();
+    });
+    let progress = progress_rx.recv_timeout(Duration::from_secs(2));
+    let early_delivery = receiver.try_recv().is_ok();
+    let premature_completion = sending.is_finished();
+    resume.send(()).unwrap();
+    reading.join().unwrap();
+    sending.join().unwrap().unwrap();
+    assert!(
+        progress.is_ok(),
+        "state lock remained held across disk flush"
+    );
+    assert!(!early_delivery, "delivery escaped before durable flush");
+    assert!(!premature_completion, "send succeeded before durable flush");
+    assert_eq!(texts(&deliveries(&mut receiver)), ["durable"]);
+    core.shutdown();
+    drop(core);
+    let recovered = BrokerCore::open(
+        "recovered",
+        Some(&path),
+        no_advisories(),
+        SecurityManager::disabled(),
+    )
+    .unwrap();
+    assert_eq!(recovered.destinations()[0].pending, 1);
+    drop(recovered);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn failed_flush_suppresses_deliveries_and_fences_later_writes() {
+    let path = super::store::tests::temp_path("flush-failure");
+    let core = BrokerCore::open(
+        "failure",
+        Some(&path),
+        no_advisories(),
+        SecurityManager::disabled(),
+    )
+    .unwrap();
+    let (connection, mut receiver) = client(&core, None);
+    let destination = Destination::queue("failure");
+    core.subscribe(connection, opts(destination.clone()))
+        .unwrap();
+    core.store.as_ref().unwrap().fail_next_flush();
+    assert!(matches!(
+        core.send(
+            connection,
+            Message::text(destination.clone(), "failed"),
+            None
+        ),
+        Err(CoreError::Store(_))
+    ));
+    assert!(receiver.try_recv().is_err(), "failed send was dispatched");
+    assert!(matches!(
+        core.send(connection, Message::text(destination, "also failed"), None),
+        Err(CoreError::Store(_))
+    ));
+    assert!(receiver.try_recv().is_err());
+    assert!(core.store.as_ref().unwrap().metrics().failed);
+    assert_eq!(
+        core.destinations()[0].enqueued,
+        1,
+        "fenced sends must not mutate routing state"
+    );
+    drop(core);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn durable_wait_keeps_single_worker_runtime_responsive() {
+    let path = super::store::tests::temp_path("runtime-progress");
+    let core = BrokerCore::open(
+        "runtime-progress",
+        Some(&path),
+        no_advisories(),
+        SecurityManager::disabled(),
+    )
+    .unwrap();
+    let (connection, _) = client(&core, None);
+    let destination = Destination::queue("runtime-progress");
+    core.create_destination(&destination).unwrap();
+    let (entered, resume) = core.store.as_ref().unwrap().pause_next_flush();
+    let (paused, waiting) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::sync_channel(1);
+    let controller = std::thread::spawn(move || {
+        entered.recv_timeout(Duration::from_secs(3)).unwrap();
+        paused.send(std::time::Instant::now()).unwrap();
+        // Always release the gate, including when a regression starves Tokio.
+        let _ = released.recv_timeout(Duration::from_secs(1));
+        resume.send(()).unwrap();
+    });
+    let sender = Arc::clone(&core);
+    let sending = tokio::spawn(async move {
+        sender.send(connection, Message::text(destination, "progress"), None)
+    });
+    let paused_at = waiting.await.unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let responsive = paused_at.elapsed() < Duration::from_millis(500);
+    let _ = release.send(());
+    sending.await.unwrap().unwrap();
+    controller.join().unwrap();
+    assert!(responsive, "durable wait pinned the only Tokio worker");
+    core.shutdown();
+    drop(core);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
 fn opts(destination: Destination) -> ConsumerOptions {
     ConsumerOptions::new(destination)
 }

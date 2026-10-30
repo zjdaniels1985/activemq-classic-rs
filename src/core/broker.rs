@@ -1,11 +1,13 @@
 //! The protocol-neutral broker: state, recovery and shared helpers.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ops::{Deref, DerefMut};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError, Weak};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -15,7 +17,9 @@ use super::queue::{Entry, MessageQueue, QueueKind, SubscriptionFilter, durable_k
 use super::scheduler::Job;
 use super::security::{Permission, Principal, SecurityManager};
 use super::selector::Selector;
-use super::store::{Batch, DurableRecord, Store};
+use super::store::{
+    Batch, CommitReceipt, DurableRecord, PendingEvent, Store, StoreOptions, blocking,
+};
 use super::types::{
     ConnectInfo, ConnectionId, ConsumerId, ConsumerOptions, CoreError, Event, Policy, ProducerId,
     TxId,
@@ -108,6 +112,7 @@ pub(crate) struct Inner {
     pub retained: BTreeMap<String, Message>,
     pub client_ids: HashMap<String, ConnectionId>,
     pub batch: Batch,
+    pub events: RefCell<Vec<PendingEvent>>,
     pub last_expiry_check: i64,
 }
 
@@ -119,7 +124,9 @@ impl Inner {
 
     pub fn emit(&self, connection: ConnectionId, event: Event) {
         if let Some(connection) = self.connections.get(&connection) {
-            let _ = connection.sender.send(event);
+            self.events
+                .borrow_mut()
+                .push((connection.sender.clone(), event));
         }
     }
 
@@ -150,6 +157,99 @@ pub struct BrokerCore {
     broker_name: String,
     broker_id: String,
     shutdown: AtomicBool,
+    lock_metrics: LockCounters,
+}
+
+#[derive(Default)]
+struct LockCounters {
+    acquisitions: AtomicU64,
+    wait_nanos: AtomicU64,
+    hold_nanos: AtomicU64,
+    max_hold_nanos: AtomicU64,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct LockMetrics {
+    pub acquisitions: u64,
+    pub wait_nanos: u64,
+    pub hold_nanos: u64,
+    pub max_hold_nanos: u64,
+}
+
+pub(crate) struct StateGuard<'a> {
+    core: &'a BrokerCore,
+    inner: Option<MutexGuard<'a, Inner>>,
+    acquired: Instant,
+}
+
+impl Deref for StateGuard<'_> {
+    type Target = Inner;
+
+    fn deref(&self) -> &Inner {
+        self.inner.as_deref().expect("state guard already released")
+    }
+}
+
+impl DerefMut for StateGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Inner {
+        self.inner
+            .as_deref_mut()
+            .expect("state guard already released")
+    }
+}
+
+impl StateGuard<'_> {
+    fn release(&mut self) -> Result<Option<CommitReceipt>, CoreError> {
+        let Some(mut inner) = self.inner.take() else {
+            return Ok(None);
+        };
+        let batch = std::mem::take(&mut inner.batch);
+        let events = inner.events.take();
+        // Enqueue under the state lock so persistence and event order match
+        // mutation order. The worker never needs the state lock.
+        let result = if let Some(store) = &self.core.store {
+            if batch.is_empty() && events.is_empty() {
+                store.check_health().map(|()| None)
+            } else {
+                store.submit(batch, events).map(Some)
+            }
+        } else {
+            for (sender, event) in events {
+                let _ = sender.send(event);
+            }
+            Ok(None)
+        };
+        let nanos = self.acquired.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+        self.core
+            .lock_metrics
+            .hold_nanos
+            .fetch_add(nanos, Ordering::Relaxed);
+        self.core
+            .lock_metrics
+            .max_hold_nanos
+            .fetch_max(nanos, Ordering::Relaxed);
+        drop(inner);
+        result.map_err(CoreError::from)
+    }
+
+    fn finish(mut self) -> Result<(), CoreError> {
+        if let Some(receipt) = self.release()? {
+            receipt.wait()?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for StateGuard<'_> {
+    fn drop(&mut self) {
+        if self.inner.is_some()
+            && let Err(error) = self.release().and_then(|receipt| {
+                receipt.map_or(Ok(()), |receipt| receipt.wait().map_err(CoreError::from))
+            })
+        {
+            tracing::error!(%error, "failed to finish broker operation");
+        }
+    }
 }
 
 impl BrokerCore {
@@ -160,7 +260,26 @@ impl BrokerCore {
         policy: Policy,
         security: SecurityManager,
     ) -> Result<Arc<Self>, CoreError> {
-        let store = data_dir.map(Store::open).transpose()?;
+        Self::open_with_store_options(
+            broker_name,
+            data_dir,
+            policy,
+            security,
+            StoreOptions::default(),
+        )
+    }
+
+    pub fn open_with_store_options(
+        broker_name: impl Into<String>,
+        data_dir: Option<&Path>,
+        policy: Policy,
+        security: SecurityManager,
+        options: StoreOptions,
+    ) -> Result<Arc<Self>, CoreError> {
+        options.validate()?;
+        let store = data_dir
+            .map(|path| Store::open_with_options(path, options))
+            .transpose()?;
         let broker_name = broker_name.into();
         let broker_id = format!("ID:{}-{}-{}", broker_name, std::process::id(), now_millis());
         let core = Arc::new(Self {
@@ -179,6 +298,7 @@ impl BrokerCore {
                 retained: BTreeMap::new(),
                 client_ids: HashMap::new(),
                 batch: Batch::default(),
+                events: RefCell::new(Vec::new()),
                 last_expiry_check: 0,
             }),
             store,
@@ -187,6 +307,7 @@ impl BrokerCore {
             broker_name,
             broker_id,
             shutdown: AtomicBool::new(false),
+            lock_metrics: LockCounters::default(),
         });
         core.recover_state()?;
         let weak = Arc::downgrade(&core);
@@ -222,24 +343,68 @@ impl BrokerCore {
 
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
-        if let Some(store) = &self.store {
-            let _ = store.flush();
+        // Join the mutation order before inserting the final persistence fence.
+        // A sender already holding the state lock must enqueue its commit first.
+        if let Err(error) = self.flush_batch(self.lock()) {
+            tracing::error!(%error, "failed to finish broker state during shutdown");
+        }
+        if let Some(store) = &self.store
+            && let Err(error) = store.flush()
+        {
+            tracing::error!(%error, "failed to flush broker during shutdown");
         }
     }
 
-    pub(crate) fn lock(&self) -> MutexGuard<'_, Inner> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    pub(crate) fn lock(&self) -> StateGuard<'_> {
+        let start = Instant::now();
+        let inner = match self.inner.try_lock() {
+            Ok(inner) => inner,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => blocking(|| {
+                self.inner
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            }),
+        };
+        self.lock_metrics
+            .acquisitions
+            .fetch_add(1, Ordering::Relaxed);
+        self.lock_metrics.wait_nanos.fetch_add(
+            start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
+        StateGuard {
+            core: self,
+            inner: Some(inner),
+            acquired: Instant::now(),
+        }
+    }
+
+    pub(crate) fn write_lock(&self) -> Result<StateGuard<'_>, CoreError> {
+        let inner = self.lock();
+        if self.shutdown.load(Ordering::SeqCst) {
+            return Err(CoreError::IllegalState("broker is shutting down".into()));
+        }
+        if let Some(store) = &self.store {
+            store.check_health()?;
+        }
+        Ok(inner)
     }
 
     /// Writes the batch accumulated during an operation.
-    pub(crate) fn flush_batch(&self, inner: &mut Inner) -> Result<(), CoreError> {
-        let batch = std::mem::take(&mut inner.batch);
-        if let Some(store) = &self.store {
-            store.apply(batch)?;
+    pub(crate) fn flush_batch(&self, inner: StateGuard<'_>) -> Result<(), CoreError> {
+        inner.finish().inspect_err(|error| {
+            tracing::error!(%error, "broker operation could not be persisted");
+        })
+    }
+
+    pub fn lock_metrics(&self) -> LockMetrics {
+        LockMetrics {
+            acquisitions: self.lock_metrics.acquisitions.load(Ordering::Relaxed),
+            wait_nanos: self.lock_metrics.wait_nanos.load(Ordering::Relaxed),
+            hold_nanos: self.lock_metrics.hold_nanos.load(Ordering::Relaxed),
+            max_hold_nanos: self.lock_metrics.max_hold_nanos.load(Ordering::Relaxed),
         }
-        Ok(())
     }
 
     fn recover_state(&self) -> Result<(), CoreError> {
@@ -368,8 +533,8 @@ impl BrokerCore {
             MessageQueue::new(key.clone(), destination.clone(), QueueKind::Queue),
         );
         if !destination.is_temporary() {
-            if let Some(store) = &self.store
-                && let Err(error) = store.put_destination(destination)
+            if self.store.is_some()
+                && let Err(error) = inner.batch.put_destination(destination)
             {
                 tracing::warn!(%error, "failed to persist destination");
             }
@@ -413,8 +578,8 @@ impl BrokerCore {
         inner
             .topics
             .insert(destination.name.clone(), TopicStats::default());
-        if let Some(store) = &self.store
-            && let Err(error) = store.put_destination(destination)
+        if self.store.is_some()
+            && let Err(error) = inner.batch.put_destination(destination)
         {
             tracing::warn!(%error, "failed to persist destination");
         }

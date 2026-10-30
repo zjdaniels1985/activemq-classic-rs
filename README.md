@@ -63,7 +63,7 @@ limited. **Unsupported** means this repository does not implement the feature.
 | Bridge delivery guarantee | At-least-once; response loss can duplicate forwarding | Depends on bridge, failover and persistence configuration; not a universal distributed transaction | Bridges support reconnect and configurable duplicate detection |
 | TLS / WebSocket | Unsupported natively; trusted network or external TLS termination required | Supported transports | Supported transports |
 | Discovery, HA and replication | Unsupported; reconnecting a connector is not broker HA | Discovery and shared-store/shared-filesystem or JDBC master/slave configurations | Discovery, shared-store HA and replication |
-| Performance comparison | Not benchmarked; no superiority claim | Established production broker | Established production broker |
+| Performance comparison | Core microbenchmark available; no measured superiority over Apache brokers | Established production broker | Established production broker |
 
 Apache sources: [Classic protocols][classic-protocols], [MQTT][classic-mqtt],
 [networks of brokers][classic-networks], [KahaDB][classic-kahadb],
@@ -157,6 +157,77 @@ administrative access, independently of messaging user permissions.
 Transports and the console use plaintext TCP/HTTP; use trusted networks or
 appropriate TLS termination.
 
+## Performance and durability
+
+Persistent operations now enqueue ordered storage records, release the
+broker-state mutex, and wait for a dedicated Sled group-commit worker.
+Concurrent operations can share one flush. Message deliveries and successful
+durable confirmations are released only after that flush succeeds.
+Message, destination, durable-subscription, scheduled-job, retained and prepared
+XA changes belonging to an operation are committed atomically across their Sled
+trees. Single-tree operations use Sled's atomic batch fast path. Shutdown drains
+accepted storage work. A storage failure suppresses pending deliveries, returns
+errors to waiting callers and fences further writes; restart/recovery is required.
+
+`[persistence.group_commit]` controls the pending request count, pending serialized
+record bytes, group operation/byte targets and maximum batching delay. The
+defaults are a 64-request queue, a 64 MiB pending-record budget, groups targeting
+64 operations / 4 MiB, and **zero deliberate delay**. Requests already waiting are
+still batched. Increasing `max_delay_us` may reduce flush count, but can worsen
+both latency and throughput on fast storage. Every successful durable operation
+still waits for a flush, including when the delay is zero.
+
+The worker applies backpressure instead of accepting an unlimited storage backlog.
+One atomic operation is never split: an operation larger than the pending-byte
+budget may occupy it alone, and group byte limits are targets, not hard message
+size caps. Backpressure can temporarily extend state-lock hold times when the
+storage budget/queue is exhausted. These limits are **not a broker-wide memory
+cap**; destination policy, prefetch and connection limits must also be configured.
+
+Each network connector reuses a forwarding connection and producer, with a
+capacity-one request queue, a dedicated cancellation-safe socket reader,
+heartbeats and correlated remote confirmations. It acknowledges the source only
+after remote acceptance. Reverse duplex demand still uses separate connections
+per destination (or per consumer with non-conduit subscriptions); temporary
+proxies retain their dedicated ownership lifetimes.
+
+The mutation mutex still exists to preserve transaction, routing and group
+ordering, but no longer covers normal storage apply/flush waits. Selector parsing
+and filesystem size accounting also happen outside it. Destination sharding and
+full duplex multiplexing remain future architectural work, not claimed here.
+Cloned messages share immutable `Arc<Body>` payloads, avoiding deep body copies
+for virtual-topic fan-out, transactions and forwarding. Wire and serialized
+storage representations are unchanged. Rust callers can keep using
+`Message::new(destination, Body::...)`; direct body matching uses
+`message.body.as_ref()`, replacement uses e.g. `Body::Empty.into()`, and intentional
+copy-on-write mutation uses `Arc::make_mut(&mut message.body)`.
+
+`GET /api/broker` includes cumulative `state_lock` acquisition/wait/hold/max-hold
+nanoseconds and `storage` request/flush/serialized-byte/flush-time/group-size/
+pending-byte/failure counters. `storage` is null for an in-memory broker.
+The benchmark reports measured send p50/p95/p99 latency:
+
+```sh
+cargo run --release --example throughput -- memory 8 500 256
+cargo run --release --example throughput -- sled 8 500 256 0
+cargo run --release --example throughput -- sled 8 500 256 1000
+```
+
+Arguments are backend, producer threads, messages per producer, payload bytes,
+and optional group delay in microseconds. The workload is bounded and uses
+independent queues with no consumers; it measures native-core send completion,
+not end-to-end protocol delivery, acknowledgement throughput or a Classic/Artemis
+comparison. Temporary benchmark stores are removed after successful completion.
+
+For orientation only, three alternating release-build trials in the development
+environment (8 producers, 4,000 persistent 256-byte sends, fresh Sled stores)
+gave median throughput of approximately **5,125 messages/s before this change**
+versus **17,864 messages/s after**, with median per-run p99 send latency
+approximately 33.1 ms versus 1.2 ms. The current runs used 771–842 flushes for
+4,000 sends plus destination creation. These short, shared-environment results
+are not production capacity estimates. Single-producer workloads can pay worker
+handoff overhead without batching gains; benchmark your own workloads and disk.
+
 ## Known compatibility limits
 
 - OpenWire negotiates v4–v12 with tight encoding and caches disabled. The
@@ -180,7 +251,8 @@ appropriate TLS termination.
   Queue/topic forwarding and temporary request/reply in both directions have
   been exercised against stock Classic 6.2.6. Temporary topic bridging remains
   unverified. Restart recovery after an established connection is covered by
-  Rust broker integration tests, not a stock Classic crash/restart test.
+  Rust integration tests and a stop/restart check against stock Classic 6.2.6;
+  that is not exhaustive unclean-crash or persistent-peer recovery coverage.
   Advisory payload forwarding requires explicit static inclusion. Consumer
   advisory forwarding and dynamic advisory includes are rejected to prevent
   fabricated network demand; static temporary destinations are unsupported.

@@ -13,7 +13,7 @@ pub(crate) fn tx_key(connection: ConnectionId, tx: &TxId) -> TxKey {
 
 impl BrokerCore {
     pub fn begin(&self, connection: ConnectionId, tx: TxId) -> Result<(), CoreError> {
-        let mut inner = self.lock();
+        let mut inner = self.write_lock()?;
         inner.principal(connection)?;
         let key = tx_key(connection, &tx);
         if inner.transactions.contains_key(&key) {
@@ -31,7 +31,7 @@ impl BrokerCore {
                 prepared: false,
             },
         );
-        Ok(())
+        self.flush_batch(inner)
     }
 
     /// Commits a transaction. `one_phase` must be true for local transactions
@@ -42,7 +42,7 @@ impl BrokerCore {
         tx: &TxId,
         one_phase: bool,
     ) -> Result<(), CoreError> {
-        let mut inner = self.lock();
+        let mut inner = self.write_lock()?;
         let key = tx_key(connection, tx);
         let Some(transaction) = inner.transactions.get(&key) else {
             return Err(CoreError::Transaction(format!(
@@ -63,7 +63,7 @@ impl BrokerCore {
         }
         let transaction = inner.transactions.remove(&key).expect("transaction");
         self.commit_locked(&mut inner, &key, transaction);
-        self.flush_batch(&mut inner)
+        self.flush_batch(inner)
     }
 
     fn commit_locked(&self, inner: &mut Inner, key: &TxKey, transaction: Transaction) {
@@ -90,7 +90,7 @@ impl BrokerCore {
         if transaction.prepared
             && let TxId::Xa(xid) = &key.1
         {
-            self.forget_prepared(xid);
+            self.forget_prepared(inner, xid);
         }
         queues.sort();
         queues.dedup();
@@ -101,7 +101,7 @@ impl BrokerCore {
     }
 
     pub fn rollback(&self, connection: ConnectionId, tx: &TxId) -> Result<(), CoreError> {
-        let mut inner = self.lock();
+        let mut inner = self.write_lock()?;
         let key = tx_key(connection, tx);
         if !inner.transactions.contains_key(&key) {
             return Err(CoreError::Transaction(format!(
@@ -109,7 +109,7 @@ impl BrokerCore {
             )));
         }
         self.rollback_locked(&mut inner, &key);
-        self.flush_batch(&mut inner)
+        self.flush_batch(inner)
     }
 
     pub(crate) fn rollback_locked(&self, inner: &mut Inner, key: &TxKey) {
@@ -145,7 +145,7 @@ impl BrokerCore {
         if transaction.prepared
             && let TxId::Xa(xid) = &key.1
         {
-            self.forget_prepared(xid);
+            self.forget_prepared(inner, xid);
         }
         queues.sort();
         queues.dedup();
@@ -163,7 +163,7 @@ impl BrokerCore {
                 "only XA transactions can be prepared".to_owned(),
             ));
         };
-        let mut inner = self.lock();
+        let mut inner = self.write_lock()?;
         let key = tx_key(connection, tx);
         let Some(transaction) = inner.transactions.get(&key) else {
             return Err(CoreError::Transaction(format!(
@@ -194,8 +194,8 @@ impl BrokerCore {
         if transaction.sends.is_empty() && transaction.detached.is_empty() {
             return Ok(true);
         }
-        if let Some(store) = &self.store {
-            store.put_prepared(&PreparedRecord {
+        if self.store.is_some() {
+            inner.batch.put_prepared(&PreparedRecord {
                 xid: xid.clone(),
                 sends: transaction.sends.clone(),
                 acks: transaction
@@ -208,6 +208,7 @@ impl BrokerCore {
         }
         transaction.prepared = true;
         inner.transactions.insert(key, transaction);
+        self.flush_batch(inner)?;
         Ok(false)
     }
 
@@ -229,15 +230,15 @@ impl BrokerCore {
 
     /// Forgets a heuristically completed transaction (rolls it back).
     pub fn forget(&self, connection: ConnectionId, tx: &TxId) -> Result<(), CoreError> {
-        let mut inner = self.lock();
+        let mut inner = self.write_lock()?;
         let key = tx_key(connection, tx);
         self.rollback_locked(&mut inner, &key);
-        self.flush_batch(&mut inner)
+        self.flush_batch(inner)
     }
 
-    fn forget_prepared(&self, xid: &XidRecord) {
-        if let Some(store) = &self.store
-            && let Err(error) = store.remove_prepared(xid)
+    fn forget_prepared(&self, inner: &mut Inner, xid: &XidRecord) {
+        if self.store.is_some()
+            && let Err(error) = inner.batch.remove_prepared(xid)
         {
             tracing::warn!(%error, "failed to remove prepared transaction");
         }

@@ -693,7 +693,7 @@ fn decode_message(
         }
     }
     if let Some((kind, value)) = body {
-        message.body = match (kind, value) {
+        message.body = Arc::new(match (kind, value) {
             (0x75, Value::Binary(data)) => Body::Bytes(data),
             (0x77, Value::String(text)) => Body::Text(text),
             (0x77, Value::Map(map)) => Body::Map(
@@ -707,7 +707,7 @@ fn decode_message(
             (_, Value::Binary(data)) => Body::Bytes(data),
             (_, Value::String(text)) => Body::Text(text),
             _ => Body::Empty,
-        };
+        });
     }
     Ok((message, None))
 }
@@ -789,7 +789,7 @@ fn encode_message(message: &Message, redelivered: bool) -> Vec<u8> {
             .collect();
         out.extend_from_slice(&encode(&described(0x74, map(entries))));
     }
-    match &message.body {
+    match message.body.as_ref() {
         Body::Empty => {}
         Body::Text(text) => out.extend_from_slice(&encode(&described(0x77, string(text.clone())))),
         Body::Bytes(data) | Body::Object(data) => {

@@ -55,7 +55,7 @@ async fn stomp_map_json_creates_native_map_and_respects_content_length() {
     let message = core
         .get_message(&destination, &pending[0].message_id)
         .unwrap();
-    let Body::Map(map) = &message.body else {
+    let Body::Map(map) = message.body.as_ref() else {
         panic!("expected native map, got {:?}", message.body);
     };
     assert_eq!(map["name"], Value::String("order".into()));
@@ -73,8 +73,9 @@ async fn stomp_map_json_creates_native_map_and_respects_content_length() {
     assert_eq!(
         core.get_message(&destination, &pending[0].message_id)
             .unwrap()
-            .body,
-        Body::Bytes(json.as_bytes().to_vec())
+            .body
+            .as_ref(),
+        &Body::Bytes(json.as_bytes().to_vec())
     );
     stream
         .write_all(

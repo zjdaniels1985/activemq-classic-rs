@@ -13,7 +13,11 @@ use super::types::{CoreError, Event};
 
 impl BrokerCore {
     pub(crate) fn tick(&self) {
-        let mut inner = self.lock();
+        let Ok(mut inner) = self.write_lock() else {
+            // A failed store is already logged and fenced; timer mutations
+            // must not accumulate while shutdown/recovery is required.
+            return;
+        };
         let now = now_millis();
         self.fire_jobs(&mut inner, now);
         self.expire_pulls(&mut inner, now);
@@ -21,7 +25,7 @@ impl BrokerCore {
             inner.last_expiry_check = now;
             self.expire_scan(&mut inner, now);
         }
-        if let Err(error) = self.flush_batch(&mut inner) {
+        if let Err(error) = self.flush_batch(inner) {
             tracing::warn!(%error, "failed to persist timer work");
         }
     }
@@ -30,8 +34,8 @@ impl BrokerCore {
         let id = format!("ID:{}-job-{}", self.broker_name(), inner.next_id());
         let job = Job::from_message(id.clone(), message, now_millis())
             .map_err(CoreError::IllegalState)?;
-        if let Some(store) = &self.store {
-            store.put_job(&job)?;
+        if self.store.is_some() {
+            inner.batch.put_job(&job)?;
         }
         tracing::debug!(job = %id, next = job.next_time, "scheduled message");
         inner.jobs.insert(id, job);
@@ -70,16 +74,14 @@ impl BrokerCore {
                 tracing::warn!(job = %id, %error, "failed to deliver scheduled message");
             }
             if job.advance(now) {
-                if let Some(store) = &self.store
-                    && let Err(error) = store.put_job(&job)
+                if self.store.is_some()
+                    && let Err(error) = inner.batch.put_job(&job)
                 {
                     tracing::warn!(%error, "failed to persist job");
                 }
                 inner.jobs.insert(id, job);
-            } else if let Some(store) = &self.store
-                && let Err(error) = store.remove_job(&id)
-            {
-                tracing::warn!(%error, "failed to remove job");
+            } else if self.store.is_some() {
+                inner.batch.remove_job(&id);
             }
         }
     }
@@ -210,11 +212,8 @@ impl BrokerCore {
 
     pub(crate) fn remove_job_locked(&self, inner: &mut Inner, id: &str) -> bool {
         let removed = inner.jobs.remove(id).is_some();
-        if removed
-            && let Some(store) = &self.store
-            && let Err(error) = store.remove_job(id)
-        {
-            tracing::warn!(%error, "failed to remove job");
+        if removed && self.store.is_some() {
+            inner.batch.remove_job(id);
         }
         removed
     }

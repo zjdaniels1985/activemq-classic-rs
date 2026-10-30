@@ -918,11 +918,11 @@ async fn write_delivery<W: AsyncWrite + Unpin>(
     for (key, value) in &message.properties {
         headers.push((key.clone(), value.to_display_string()));
     }
-    let bytes = matches!(message.body, Body::Bytes(_) | Body::Object(_));
+    let bytes = matches!(message.body.as_ref(), Body::Bytes(_) | Body::Object(_));
     if bytes {
         headers.push(("content-length".into(), message.body.len().to_string()));
     }
-    let body = match &message.body {
+    let body = match message.body.as_ref() {
         Body::Text(text) => text.as_bytes().to_vec(),
         Body::Map(map)
             if message

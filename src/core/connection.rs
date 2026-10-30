@@ -49,7 +49,7 @@ impl BrokerCore {
         principal: Principal,
     ) -> Result<(ConnectionId, UnboundedReceiver<Event>), CoreError> {
         info.password = None;
-        let mut inner = self.lock();
+        let mut inner = self.write_lock()?;
         if let Some(client_id) = info.client_id.clone().filter(|id| !id.is_empty()) {
             if let Some(existing) = inner.client_ids.get(&client_id).copied() {
                 if !info.takeover {
@@ -108,7 +108,7 @@ impl BrokerCore {
             },
         );
         self.advise(&mut inner, Destination::topic(CONNECTION_ADVISORY), data);
-        self.flush_batch(&mut inner)?;
+        self.flush_batch(inner)?;
         Ok((id, receiver))
     }
 
@@ -117,7 +117,7 @@ impl BrokerCore {
     pub fn disconnect(&self, connection: ConnectionId) {
         let mut inner = self.lock();
         self.disconnect_locked(&mut inner, connection);
-        if let Err(error) = self.flush_batch(&mut inner) {
+        if let Err(error) = self.flush_batch(inner) {
             tracing::warn!(%error, "failed to persist disconnect");
         }
     }
@@ -183,7 +183,7 @@ impl BrokerCore {
         connection: ConnectionId,
         destination: Option<Destination>,
     ) -> Result<ProducerId, CoreError> {
-        let mut inner = self.lock();
+        let mut inner = self.write_lock()?;
         let principal = inner.principal(connection)?;
         if let Some(destination) = &destination {
             self.check_access(&inner, &principal, destination, Permission::Write)?;
@@ -206,14 +206,14 @@ impl BrokerCore {
                 },
             );
         }
-        self.flush_batch(&mut inner)?;
+        self.flush_batch(inner)?;
         Ok(id)
     }
 
     pub fn unregister_producer(&self, producer: ProducerId) {
         let mut inner = self.lock();
         self.unregister_producer_locked(&mut inner, producer);
-        let _ = self.flush_batch(&mut inner);
+        let _ = self.flush_batch(inner);
     }
 
     fn unregister_producer_locked(&self, inner: &mut Inner, producer: ProducerId) {
@@ -246,7 +246,7 @@ impl BrokerCore {
                 "{destination} is not a temporary destination"
             )));
         }
-        let mut inner = self.lock();
+        let mut inner = self.write_lock()?;
         let state = inner
             .connections
             .get(&connection)
@@ -275,7 +275,7 @@ impl BrokerCore {
             destination.destination_advisory_topic(),
             AdvisoryData::DestinationAdded(destination.clone()),
         );
-        self.flush_batch(&mut inner)
+        self.flush_batch(inner)
     }
 
     /// Generates a name and creates a temporary destination.
@@ -296,7 +296,7 @@ impl BrokerCore {
         connection: ConnectionId,
         destination: &Destination,
     ) -> Result<(), CoreError> {
-        let mut inner = self.lock();
+        let mut inner = self.write_lock()?;
         let in_use = inner.consumers.values().any(|consumer| {
             consumer.connection != connection && consumer.options.destination == *destination
         });
@@ -309,7 +309,7 @@ impl BrokerCore {
             state.temps.remove(destination);
         }
         self.delete_temp_locked(&mut inner, destination);
-        self.flush_batch(&mut inner)
+        self.flush_batch(inner)
     }
 
     pub(crate) fn delete_temp_locked(&self, inner: &mut Inner, destination: &Destination) {
@@ -352,7 +352,7 @@ impl BrokerCore {
         if destination.is_temporary() {
             return self.create_temp(connection, destination.clone());
         }
-        let mut inner = self.lock();
+        let mut inner = self.write_lock()?;
         let principal = inner.principal(connection)?;
         for component in destination.components() {
             if inner.destination_exists(&component) {
@@ -366,7 +366,7 @@ impl BrokerCore {
                 self.ensure_queue(&mut inner, &component);
             }
         }
-        self.flush_batch(&mut inner)
+        self.flush_batch(inner)
     }
 
     /// Sends a message, optionally inside a transaction.
@@ -376,7 +376,7 @@ impl BrokerCore {
         mut message: Message,
         tx: Option<&TxId>,
     ) -> Result<(), CoreError> {
-        let mut inner = self.lock();
+        let mut inner = self.write_lock()?;
         let principal = inner.principal(connection)?;
         for component in message.destination.components() {
             if component.is_wildcard() {
@@ -396,7 +396,7 @@ impl BrokerCore {
             && message.destination.name == SCHEDULER_MANAGEMENT_TOPIC
         {
             self.scheduler_management(&mut inner, &message)?;
-            return self.flush_batch(&mut inner);
+            return self.flush_batch(inner);
         }
         if let Some(tx) = tx {
             let key = super::tx::tx_key(connection, tx);
@@ -410,10 +410,10 @@ impl BrokerCore {
                 )));
             }
             transaction.sends.push(message);
-            return Ok(());
+            return self.flush_batch(inner);
         }
         let result = self.accept(&mut inner, message);
-        self.flush_batch(&mut inner)?;
+        self.flush_batch(inner)?;
         result
     }
 
@@ -469,10 +469,8 @@ impl BrokerCore {
         let topic = message.destination.name.clone();
         if message.body.is_empty() {
             inner.retained.remove(&topic);
-            if let Some(store) = &self.store
-                && let Err(error) = store.remove_retained(&topic)
-            {
-                tracing::warn!(%error, "failed to remove retained message");
+            if self.store.is_some() {
+                inner.batch.remove_retained(&topic);
             }
             return;
         }
@@ -480,8 +478,8 @@ impl BrokerCore {
         retained
             .properties
             .insert(RETAINED_PROPERTY.to_owned(), Value::Bool(true));
-        if let Some(store) = &self.store
-            && let Err(error) = store.put_retained(&topic, &retained)
+        if self.store.is_some()
+            && let Err(error) = inner.batch.put_retained(&topic, &retained)
         {
             tracing::warn!(%error, "failed to persist retained message");
         }

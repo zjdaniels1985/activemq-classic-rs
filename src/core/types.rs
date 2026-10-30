@@ -342,7 +342,7 @@ pub struct MessageView {
 
 impl MessageView {
     pub fn from_message(message: &Message) -> Self {
-        let body = match &message.body {
+        let body = match message.body.as_ref() {
             super::message::Body::Text(text) => text.clone(),
             super::message::Body::Empty => String::new(),
             other => format!("<{} bytes>", other.len()),

@@ -61,6 +61,13 @@ bind = "127.0.0.1:1883"
 backend = "sled"                      # "sled" or "memory"
 path = "./data/sled"
 
+[persistence.group_commit]
+queue_capacity = 64
+max_batch_operations = 64
+max_batch_bytes = 4194304
+max_pending_bytes = 67108864          # backpressure; one oversized atomic operation may run alone
+max_delay_us = 0                      # opportunistic batching; >0 allows a bounded batching wait
+
 [web_console]
 enabled = true
 bind = "127.0.0.1:8161"

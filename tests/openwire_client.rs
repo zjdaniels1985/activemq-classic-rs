@@ -61,8 +61,8 @@ async fn public_client_round_trips_queue_messages_and_acknowledgements() {
         .expect("message delivery");
     assert_eq!(received.message_id, message_id);
     assert_eq!(
-        received.body,
-        Body::Text("client API round trip".to_owned())
+        received.body.as_ref(),
+        &Body::Text("client API round trip".to_owned())
     );
     assert_eq!(received.properties.get("sequence"), Some(&42_i32.into()));
     assert_eq!(redelivery, 0);

@@ -1,6 +1,7 @@
 use super::destination::Destination;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -225,7 +226,7 @@ pub struct Message {
     #[serde(default)]
     pub properties: BTreeMap<String, Value>,
     #[serde(default)]
-    pub body: Body,
+    pub body: Arc<Body>,
     #[serde(default)]
     pub advisory: Option<AdvisoryData>,
 }
@@ -253,7 +254,7 @@ impl Message {
             broker_path: Vec::new(),
             broker_in_time: 0,
             properties: BTreeMap::new(),
-            body,
+            body: Arc::new(body),
             advisory: None,
         }
     }
@@ -280,7 +281,7 @@ impl Message {
     }
 
     pub fn text_body(&self) -> Option<&str> {
-        match &self.body {
+        match self.body.as_ref() {
             Body::Text(text) => Some(text),
             _ => None,
         }
