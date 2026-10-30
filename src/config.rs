@@ -50,6 +50,10 @@ impl AppConfig {
             )));
         }
         self.persistence.group_commit.validate()?;
+        self.policy
+            .subscription_recovery
+            .validate()
+            .map_err(|error| invalid(error.to_string()))?;
         if self.broker.max_frame_size == 0 || self.broker.max_frame_size > i32::MAX as usize {
             return Err(invalid(
                 "broker.max_frame_size must be between 1 and i32::MAX",
@@ -374,6 +378,30 @@ mod tests {
         assert!(AppConfig::parse("[persistence.group_commit]\nmax_delay_us = 1000001\n").is_err());
         let config = AppConfig::parse("[persistence.group_commit]\nmax_delay_us = 0\n").unwrap();
         assert_eq!(config.persistence.group_commit.max_delay_us, 0);
+    }
+
+    #[test]
+    fn validates_topic_subscription_recovery_configuration() {
+        let config = AppConfig::parse(
+            "[policy.subscription_recovery]\ntype = 'fixed_count'\nmaximum_size = 100\n",
+        )
+        .unwrap();
+        assert_eq!(config.policy.subscription_recovery.capacity(), 100);
+        assert!(
+            AppConfig::parse(
+                "[policy.subscription_recovery]\ntype = 'fixed_count'\nmaximum_size = 0\n"
+            )
+            .is_err()
+        );
+        assert!(AppConfig::parse("[policy.subscription_recovery]\ntype = 'timed'\n").is_err());
+        assert_eq!(
+            AppConfig::parse("[policy.subscription_recovery]\ntype = 'last_image'\n")
+                .unwrap()
+                .policy
+                .subscription_recovery
+                .capacity(),
+            1
+        );
     }
 
     #[test]

@@ -19,6 +19,11 @@ virtual_topic_prefix = "VirtualTopic."
 virtual_topic_consumer_prefix = "Consumer."
 auto_create_destinations = true
 expire_check_interval_ms = 1000
+always_retroactive = false
+# Volatile per-topic history, replayed for consumer.retroactive=true.
+# [policy.subscription_recovery]
+# type = "fixed_count"                # "none" (default), "last_image", "fixed_count"
+# maximum_size = 100                  # required only for fixed_count
 
 # Simple authentication + authorization plugins.
 [security]

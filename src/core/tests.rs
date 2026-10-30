@@ -74,6 +74,136 @@ fn temporary_destination_cannot_be_claimed_by_another_connection() {
 }
 
 #[test]
+fn topic_recovery_is_bounded_filtered_and_only_enabled_for_retroactive_consumers() {
+    let core = core_with(Policy {
+        subscription_recovery: SubscriptionRecoveryPolicy::FixedCount { maximum_size: 2 },
+        ..no_advisories()
+    });
+    let (publisher, _) = client(&core, None);
+    let destination = Destination::topic("recovery.quotes");
+    for (text, color) in [("evicted", "blue"), ("red", "red"), ("blue", "blue")] {
+        core.send(
+            publisher,
+            Message::text(destination.clone(), text).with_property("color", color),
+            None,
+        )
+        .unwrap();
+    }
+    let (connection, mut receiver) = client(&core, None);
+    core.subscribe(connection, opts(destination.clone()))
+        .unwrap();
+    assert!(deliveries(&mut receiver).is_empty());
+    let mut retro = opts(Destination::topic("recovery.>"));
+    retro.retroactive = true;
+    retro.selector = Some("color = 'blue'".into());
+    core.subscribe(connection, retro).unwrap();
+    assert_eq!(texts(&deliveries(&mut receiver)), ["blue"]);
+    assert_eq!(core.lock().topics["recovery.quotes"].recovery.len(), 2);
+}
+
+#[test]
+fn last_image_recovery_honors_no_local_expiry_and_transaction_rollback() {
+    let core = core_with(Policy {
+        subscription_recovery: SubscriptionRecoveryPolicy::LastImage,
+        ..no_advisories()
+    });
+    let (connection, mut receiver) = client(&core, None);
+    let destination = Destination::topic("image");
+    send_text(&core, connection, destination.clone(), "before");
+    let tx = TxId::Local("image".into());
+    core.begin(connection, tx.clone()).unwrap();
+    core.send(
+        connection,
+        Message::text(destination.clone(), "rolled back"),
+        Some(&tx),
+    )
+    .unwrap();
+    core.rollback(connection, &tx).unwrap();
+    let mut retro = opts(destination.clone());
+    retro.retroactive = true;
+    retro.no_local = true;
+    core.subscribe(connection, retro).unwrap();
+    assert!(deliveries(&mut receiver).is_empty());
+    let (other, mut other_receiver) = client(&core, None);
+    let mut retro = opts(destination.clone());
+    retro.retroactive = true;
+    core.subscribe(other, retro).unwrap();
+    assert_eq!(texts(&deliveries(&mut other_receiver)), ["before"]);
+    let mut expired = Message::text(destination.clone(), "expired");
+    expired.expiration = super::message::now_millis() - 1;
+    core.send(connection, expired, None).unwrap();
+    let mut retro = opts(destination);
+    retro.retroactive = true;
+    core.subscribe(other, retro).unwrap();
+    assert!(deliveries(&mut other_receiver).is_empty());
+}
+
+#[test]
+fn always_retroactive_replays_history_and_topic_delete_discards_it() {
+    let core = core_with(Policy {
+        subscription_recovery: SubscriptionRecoveryPolicy::LastImage,
+        always_retroactive: true,
+        ..no_advisories()
+    });
+    let (connection, mut receiver) = client(&core, None);
+    let destination = Destination::topic("image");
+    send_text(&core, connection, destination.clone(), "image");
+    let consumer = core
+        .subscribe(connection, opts(destination.clone()))
+        .unwrap();
+    assert_eq!(texts(&deliveries(&mut receiver)), ["image"]);
+    core.close_consumer(consumer);
+    core.remove_destination(connection, &destination).unwrap();
+    core.subscribe(connection, opts(destination)).unwrap();
+    assert!(deliveries(&mut receiver).is_empty());
+}
+
+#[test]
+fn durable_recovery_does_not_duplicate_offline_backlog() {
+    let core = core_with(Policy {
+        subscription_recovery: SubscriptionRecoveryPolicy::FixedCount { maximum_size: 2 },
+        ..no_advisories()
+    });
+    let (publisher, _) = client(&core, None);
+    let destination = Destination::topic("durable.recovery");
+    send_text(&core, publisher, destination.clone(), "before");
+    let (connection, mut receiver) = client(&core, Some("durable-recovery"));
+    let mut options = opts(destination.clone());
+    options.retroactive = true;
+    options.durable_name = Some("history".into());
+    let consumer = core.subscribe(connection, options.clone()).unwrap();
+    assert_eq!(texts(&deliveries(&mut receiver)), ["before"]);
+    core.ack(connection, consumer, Acks::All, AckOp::Consumed, None)
+        .unwrap();
+    core.close_consumer(consumer);
+    send_text(&core, publisher, destination, "offline");
+    core.subscribe(connection, options).unwrap();
+    assert_eq!(texts(&deliveries(&mut receiver)), ["offline"]);
+}
+
+#[test]
+fn protocol_destination_removal_rejects_live_consumers_but_admin_can_close_them() {
+    let core = core_with(no_advisories());
+    let (connection, _) = client(&core, None);
+    let destination = Destination::queue("lifecycle");
+    let consumer = core
+        .subscribe(connection, opts(destination.clone()))
+        .unwrap();
+    assert!(core.remove_destination(connection, &destination).is_err());
+    core.close_consumer(consumer);
+    core.remove_destination(connection, &destination).unwrap();
+    assert!(
+        core.destinations()
+            .iter()
+            .all(|stats| stats.destination != destination)
+    );
+    core.subscribe(connection, opts(destination.clone()))
+        .unwrap();
+    core.delete_destination(&destination).unwrap();
+    assert!(core.consumers().is_empty());
+}
+
+#[test]
 fn shared_bodies_preserve_storage_encoding_and_copy_on_write() {
     let mut message = Message::text(Destination::queue("q"), "original");
     let copy = message.clone();
@@ -622,6 +752,10 @@ fn security_authentication_and_authorization() {
     ));
     send_text(&core, admin, Destination::queue("secure"), "hi");
     assert!(matches!(
+        core.remove_destination(reader, &Destination::queue("secure")),
+        Err(CoreError::Security(_))
+    ));
+    assert!(matches!(
         core.send(
             reader,
             Message::text(Destination::queue("secure"), "x"),
@@ -629,9 +763,17 @@ fn security_authentication_and_authorization() {
         ),
         Err(CoreError::Security(_))
     ));
-    core.subscribe(reader, opts(Destination::queue("secure")))
+    let consumer = core
+        .subscribe(reader, opts(Destination::queue("secure")))
         .unwrap();
     assert_eq!(texts(&deliveries(&mut rrx)), vec!["hi"]);
+    assert!(matches!(
+        core.remove_destination(admin, &Destination::queue("secure")),
+        Err(CoreError::IllegalState(_))
+    ));
+    core.close_consumer(consumer);
+    core.remove_destination(admin, &Destination::queue("secure"))
+        .unwrap();
 }
 
 #[test]

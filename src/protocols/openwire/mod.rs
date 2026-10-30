@@ -25,7 +25,12 @@ use crate::core::{
 use codec::{Decoder, IncomingMessage};
 
 const MAX_WIRE_VERSION: i32 = 12;
-const MIN_WIRE_VERSION: i32 = 4;
+const MIN_WIRE_VERSION: i32 = 1;
+
+struct DispatchedDelivery {
+    delivery_id: u64,
+    message_id: String,
+}
 
 pub fn encode_client_message(
     producer: &WireId,
@@ -45,12 +50,13 @@ async fn handle_connection(
     remote: SocketAddr,
 ) -> io::Result<()> {
     let max_size = context.max_frame_size;
-    let first = read_frame(&mut stream, max_size).await?;
+    let mut reader = FrameReader::default();
+    let first = reader.read_frame(&mut stream, max_size).await?;
     let (client_version, client_idle_timeout) = codec::validate_wire_format(&first)?;
     if client_version < MIN_WIRE_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "OpenWire versions 1-3 omit destination data required for broker routing",
+            "OpenWire version must be at least 1",
         ));
     }
     let version = client_version.min(MAX_WIRE_VERSION);
@@ -62,7 +68,7 @@ async fn handle_connection(
     .await?;
     write_frame(
         &mut stream,
-        &codec::encode_broker_info(&context.core.info().id, &context.core.info().name),
+        &codec::encode_broker_info(&context.core.info().id, &context.core.info().name, version),
         max_size,
     )
     .await?;
@@ -75,7 +81,7 @@ async fn handle_connection(
     let mut consumer_destinations: HashMap<u64, WireDestination> = HashMap::new();
     let mut producers: HashMap<WireId, u64> = HashMap::new();
     let mut producer_windows: HashMap<WireId, i32> = HashMap::new();
-    let mut delivery_ids: HashMap<(WireId, String), u64> = HashMap::new();
+    let mut delivery_ids: HashMap<(WireId, String), DispatchedDelivery> = HashMap::new();
     let mut command_id = 1_i64;
     let mut last_seen = Instant::now();
     let mut heartbeat = time::interval(Duration::from_secs(10));
@@ -83,7 +89,7 @@ async fn handle_connection(
 
     loop {
         tokio::select! {
-            result = read_frame(&mut stream, max_size) => {
+            result = reader.read_frame(&mut stream, max_size) => {
                 let frame = match result { Ok(frame) => frame, Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break, Err(error) => return Err(error) };
                 last_seen = Instant::now();
                 process_command(&context, &remote, frame, &mut stream, max_size, version, &cleanup, &mut core_connection, &mut events, &mut consumers, &mut consumer_wire, &mut consumer_destinations, &mut producers, &mut producer_windows, &mut delivery_ids).await?;
@@ -102,7 +108,13 @@ async fn handle_connection(
                             let destination = codec::wire_destination(&message.destination);
                             let frame = codec::encode_dispatch_version(wire, &destination, message, command_id, u32::from(delivery.redelivered).saturating_mul(message.redelivery_counter), version);
                             command_id = command_id.wrapping_add(1);
-                            delivery_ids.insert((wire.clone(), message.message_id.clone()), delivery.delivery_id);
+                            delivery_ids.insert(
+                                (wire.clone(), codec::dispatched_message_id(&message.message_id, version)),
+                                DispatchedDelivery {
+                                    delivery_id: delivery.delivery_id,
+                                    message_id: message.message_id.clone(),
+                                },
+                            );
                             write_frame(&mut stream, &frame, max_size).await?;
                         }
                     }
@@ -116,7 +128,8 @@ async fn handle_connection(
                         if let Some(wire) = consumer_wire.remove(&consumer) {
                             consumers.remove(&wire);
                             consumer_destinations.remove(&consumer);
-                            write_frame(&mut stream, &encode_remove_info(&wire), max_size).await?;
+                            delivery_ids.retain(|(consumer, _), _| *consumer != wire);
+                            write_frame(&mut stream, &encode_remove_info(&wire, version), max_size).await?;
                         }
                     }
                     Some(Event::ConnectionClosed { .. }) | None => break,
@@ -182,7 +195,7 @@ async fn process_command(
     consumer_destinations: &mut HashMap<u64, WireDestination>,
     producers: &mut HashMap<WireId, u64>,
     producer_windows: &mut HashMap<WireId, i32>,
-    delivery_ids: &mut HashMap<(WireId, String), u64>,
+    delivery_ids: &mut HashMap<(WireId, String), DispatchedDelivery>,
 ) -> io::Result<bool> {
     tracing::debug!(
         command_type = frame.command_type,
@@ -241,6 +254,7 @@ async fn process_command(
             options.durable_name = info.subscription_name.clone();
             options.browser = info.browser;
             options.exclusive = info.exclusive;
+            options.retroactive = info.retroactive;
             options.priority = info.priority;
             options.network = info.network;
             options.broker_path = info.broker_path.clone();
@@ -306,10 +320,12 @@ async fn process_command(
                 .await;
             };
             let dest = core_destination(&destination);
-            let result = if operation == 0 {
-                context.core.add_destination(connection, &dest)
-            } else {
-                context.core.delete_temp(connection, &dest)
+            let result = match operation {
+                0 => context.core.add_destination(connection, &dest),
+                1 => context.core.remove_destination(connection, &dest),
+                _ => Err(CoreError::IllegalState(format!(
+                    "unsupported destination operation {operation}"
+                ))),
             };
             match result {
                 Ok(()) => {
@@ -355,7 +371,9 @@ async fn process_command(
                         if let Some(consumer) = consumers.remove(&wire) {
                             context.core.close_consumer(consumer);
                             consumer_wire.remove(&consumer);
+                            consumer_destinations.remove(&consumer);
                         }
+                        delivery_ids.retain(|(consumer, _), _| *consumer != wire);
                     }
                     123 => {
                         if let Some(producer) = producers.remove(&wire) {
@@ -363,10 +381,50 @@ async fn process_command(
                         }
                         producer_windows.remove(&wire);
                     }
-                    120 | 121 => {}
+                    121 => {
+                        let children = consumers
+                            .keys()
+                            .filter(|id| {
+                                id.connection == wire.connection && id.session == wire.session
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        for child in children {
+                            if let Some(consumer) = consumers.remove(&child) {
+                                context.core.close_consumer(consumer);
+                                consumer_wire.remove(&consumer);
+                                consumer_destinations.remove(&consumer);
+                            }
+                            delivery_ids.retain(|(consumer, _), _| *consumer != child);
+                        }
+                        let children = producers
+                            .keys()
+                            .filter(|id| {
+                                id.connection == wire.connection && id.session == wire.session
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        for child in children {
+                            if let Some(producer) = producers.remove(&child) {
+                                context.core.unregister_producer(producer);
+                            }
+                            producer_windows.remove(&child);
+                        }
+                    }
+                    120 => {
+                        context.core.disconnect(conn);
+                        *connection = None;
+                        cleanup.set(None);
+                        *events = None;
+                        consumers.clear();
+                        consumer_wire.clear();
+                        consumer_destinations.clear();
+                        producers.clear();
+                        producer_windows.clear();
+                        delivery_ids.clear();
+                    }
                     _ => {}
                 }
-                let _ = conn;
             }
             if header.response_required {
                 send_response(stream, &header, max_size).await?;
@@ -399,17 +457,24 @@ async fn process_command(
                     5 => AckOp::Release { increment: false },
                     _ => AckOp::Consumed,
                 };
+                let target = ack
+                    .message_id
+                    .as_ref()
+                    .and_then(|mid| delivery_ids.get(&(ack.consumer.clone(), mid.clone())));
+                let last_delivery = target.map(|delivery| delivery.delivery_id);
+                let cumulative = ack.ack_type == 2 || ack.count > 1;
                 let acknowledgements = if let Some(mid) = ack.message_id.as_ref() {
-                    if ack.ack_type == 2 || ack.count > 1 {
+                    if cumulative {
                         Acks::MessageId {
-                            id: mid.clone(),
+                            id: target.map_or_else(
+                                || mid.clone(),
+                                |delivery| delivery.message_id.clone(),
+                            ),
                             up_to: true,
                         }
                     } else {
-                        delivery_ids
-                            .get(&(ack.consumer.clone(), mid.clone()))
-                            .copied()
-                            .map(|id| Acks::Deliveries(vec![id]))
+                        target
+                            .map(|delivery| Acks::Deliveries(vec![delivery.delivery_id]))
                             .unwrap_or_else(|| Acks::MessageId {
                                 id: mid.clone(),
                                 up_to: false,
@@ -427,6 +492,16 @@ async fn process_command(
                 ) {
                     send_error(stream, &ack.header, &error, max_size).await?;
                     return Ok(true);
+                }
+                if operation != AckOp::Delivered && ack.tx.is_none() {
+                    delivery_ids.retain(|(consumer, _), delivery| {
+                        *consumer != ack.consumer
+                            || match last_delivery {
+                                Some(last) if cumulative => delivery.delivery_id > last,
+                                Some(last) => delivery.delivery_id != last,
+                                None => ack.message_id.is_some(),
+                            }
+                    });
                 }
             }
             if ack.header.response_required {
@@ -543,10 +618,14 @@ async fn process_command(
             Ok(true)
         }
         _ => {
-            if let Some(header) = command_header(&frame)?
-                && header.response_required
-            {
-                send_response(stream, &header, max_size).await?;
+            if let Some(header) = command_header(&frame)? {
+                return send_protocol_error(
+                    stream,
+                    &header,
+                    &format!("unsupported OpenWire command {}", frame.command_type),
+                    max_size,
+                )
+                .await;
             }
             Ok(false)
         }
@@ -756,21 +835,57 @@ async fn send_protocol_error(
     .await?;
     Ok(true)
 }
-async fn read_frame(stream: &mut TcpStream, max: usize) -> io::Result<OpenWireFrame> {
-    let size = stream.read_u32().await? as usize;
-    if size == 0 || size > max {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid or oversized OpenWire frame",
-        ));
-    }
-    let mut b = vec![0; size];
-    stream.read_exact(&mut b).await?;
-    Ok(OpenWireFrame {
-        command_type: b[0],
-        payload: b[1..].to_vec(),
-    })
+#[derive(Default)]
+struct FrameReader {
+    header: [u8; 4],
+    header_read: usize,
+    body: Vec<u8>,
+    body_read: usize,
 }
+
+impl FrameReader {
+    // All partial progress survives select! cancellation when a dispatch or
+    // heartbeat wins. read_exact/read_u32 would discard that progress.
+    async fn read_frame(
+        &mut self,
+        stream: &mut TcpStream,
+        max: usize,
+    ) -> io::Result<OpenWireFrame> {
+        while self.header_read < self.header.len() {
+            let count = stream.read(&mut self.header[self.header_read..]).await?;
+            if count == 0 {
+                return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+            }
+            self.header_read += count;
+        }
+        let size = u32::from_be_bytes(self.header) as usize;
+        if size == 0 || size > max {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid or oversized OpenWire frame",
+            ));
+        }
+        if self.body.is_empty() {
+            self.body.resize(size, 0);
+        }
+        while self.body_read < size {
+            let count = stream.read(&mut self.body[self.body_read..]).await?;
+            if count == 0 {
+                return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+            }
+            self.body_read += count;
+        }
+        let frame = OpenWireFrame {
+            command_type: self.body[0],
+            payload: self.body[1..].to_vec(),
+        };
+        self.header_read = 0;
+        self.body.clear();
+        self.body_read = 0;
+        Ok(frame)
+    }
+}
+
 async fn write_frame(stream: &mut TcpStream, frame: &OpenWireFrame, max: usize) -> io::Result<()> {
     let mut b = Vec::new();
     frame.write_to(&mut b, max)?;
@@ -807,11 +922,98 @@ fn encode_pull_empty(wire: &WireId, destination: Option<WireDestination>) -> Ope
         payload: p,
     }
 }
-fn encode_remove_info(wire: &WireId) -> OpenWireFrame {
+fn encode_remove_info(wire: &WireId, version: i32) -> OpenWireFrame {
     let mut p = codec::base(0, false);
     codec::nested_id(&mut p, 122, wire);
+    if version >= 5 {
+        p.extend_from_slice(&0i64.to_be_bytes());
+    }
     OpenWireFrame {
         command_type: 12,
         payload: p,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_remove_info_has_the_negotiated_version_layout() {
+        let wire = WireId {
+            connection: "ID:client".into(),
+            session: 2,
+            value: 3,
+        };
+        for version in 1..=12 {
+            let frame = encode_remove_info(&wire, version);
+            let mut decoder = Decoder::new(&frame.payload);
+            decoder.header().unwrap();
+            assert_eq!(decoder.id(122).unwrap(), Some(wire.clone()));
+            if version >= 5 {
+                assert_eq!(decoder.i64().unwrap(), 0);
+            }
+            assert_eq!(decoder.position() as usize, frame.payload.len());
+        }
+    }
+
+    #[tokio::test]
+    async fn frame_reader_preserves_fragmented_progress_when_cancelled() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut writer = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut reader = FrameReader::default();
+        let header = 6u32.to_be_bytes();
+        writer.write_all(&header[..2]).await.unwrap();
+        assert!(
+            time::timeout(
+                Duration::from_millis(20),
+                reader.read_frame(&mut stream, 1024)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(reader.header_read, 2);
+        writer.write_all(&header[2..]).await.unwrap();
+        writer.write_all(&[10, 0]).await.unwrap();
+        assert!(
+            time::timeout(
+                Duration::from_millis(20),
+                reader.read_frame(&mut stream, 1024)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(reader.body_read, 2);
+        writer.write_all(&[0, 0, 1, 0]).await.unwrap();
+        let frame = reader.read_frame(&mut stream, 1024).await.unwrap();
+        assert_eq!(frame.command_type, 10);
+        assert_eq!(frame.payload, [0, 0, 0, 1, 0]);
+        writer.write_all(&[0, 0, 0, 1, 15]).await.unwrap();
+        let next = reader.read_frame(&mut stream, 1024).await.unwrap();
+        assert_eq!(next.command_type, 15);
+        assert!(next.payload.is_empty());
+    }
+
+    #[tokio::test]
+    async fn frame_reader_rejects_oversized_frame_before_allocating() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut writer = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut reader = FrameReader::default();
+        writer.write_all(&4096u32.to_be_bytes()).await.unwrap();
+        assert_eq!(
+            reader
+                .read_frame(&mut stream, 1024)
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(reader.body.is_empty());
     }
 }

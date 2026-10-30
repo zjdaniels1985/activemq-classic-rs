@@ -167,6 +167,45 @@ async fn malformed_openwire_command_releases_established_connection() {
 }
 
 #[tokio::test]
+async fn unsupported_openwire_command_returns_an_exception_not_success() {
+    use activemq_classic_rs::protocols::openwire::OpenWireFrame;
+
+    let broker = activemq_classic_rs::runtime::start(test_config())
+        .await
+        .unwrap();
+    let mut client = OpenWireClient::connect_client(
+        broker.address("openwire").unwrap(),
+        8 * 1024 * 1024,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let command = client.next_command_id();
+    let mut payload = command.to_be_bytes().to_vec();
+    payload.push(1);
+    client
+        .send_command(&OpenWireFrame {
+            command_type: 254,
+            payload,
+        })
+        .await
+        .unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(3), client.receive())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.command_type, 31);
+    assert_eq!(&response.payload[5..9], &command.to_be_bytes());
+    client
+        .create_consumer(&Destination::queue("after-unsupported-command"), 1, None)
+        .await
+        .unwrap();
+    broker.stop();
+}
+
+#[tokio::test]
 async fn public_client_manages_temporary_destinations_and_network_consumers() {
     let broker = activemq_classic_rs::runtime::start(test_config())
         .await

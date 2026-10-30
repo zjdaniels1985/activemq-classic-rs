@@ -94,6 +94,7 @@ pub struct ConsumerInfo {
     pub subscription_name: Option<String>,
     pub no_local: bool,
     pub exclusive: bool,
+    pub retroactive: bool,
     pub priority: i8,
     pub network: bool,
     pub broker_path: Vec<String>,
@@ -341,9 +342,7 @@ fn nested_end_version(bytes: &[u8], start: usize, kind: u8, version: i32) -> io:
             d.header()?;
             d.id(122)?;
             d.bool()?;
-            if version >= 4 {
-                d.destination()?;
-            }
+            d.destination()?;
             d.i32()?;
             d.i32()?;
             d.bool()?;
@@ -357,9 +356,7 @@ fn nested_end_version(bytes: &[u8], start: usize, kind: u8, version: i32) -> io:
             d.bool()?;
             d.i8()?;
             skip_broker_path(&mut d)?;
-            if version >= 4 {
-                d.skip_nested()?;
-            }
+            d.skip_nested()?;
             d.bool()?;
             d.bool()?;
             d.bool()?;
@@ -382,9 +379,7 @@ fn nested_end_version(bytes: &[u8], start: usize, kind: u8, version: i32) -> io:
         8 => {
             d.header()?;
             d.id(120)?;
-            if version >= 4 {
-                d.destination()?;
-            }
+            d.destination()?;
             d.i8()?;
             d.i64()?;
             skip_broker_path(&mut d)?;
@@ -431,7 +426,7 @@ pub fn decode_consumer_version(frame: &OpenWireFrame, version: i32) -> io::Resul
         .id(122)?
         .ok_or_else(|| invalid("ConsumerInfo is missing ConsumerId"))?;
     let browser = d.bool()?;
-    let destination = if version >= 4 { d.destination()? } else { None };
+    let destination = d.destination()?;
     let prefetch = d.i32()?;
     d.i32()?;
     d.bool()?;
@@ -442,7 +437,7 @@ pub fn decode_consumer_version(frame: &OpenWireFrame, version: i32) -> io::Resul
     let subscription_name = d.string()?;
     let no_local = d.bool()?;
     let exclusive = d.bool()?;
-    d.bool()?;
+    let retroactive = d.bool()?;
     let priority = d.i8()?;
     let mut broker_path = Vec::new();
     if d.bool()? {
@@ -455,9 +450,7 @@ pub fn decode_consumer_version(frame: &OpenWireFrame, version: i32) -> io::Resul
             broker_path.push(nested.string()?.unwrap_or_default());
         }
     }
-    if version >= 4 {
-        d.skip_nested()?;
-    }
+    d.skip_nested()?;
     let network = d.bool()?;
     d.bool()?;
     d.bool()?;
@@ -468,14 +461,13 @@ pub fn decode_consumer_version(frame: &OpenWireFrame, version: i32) -> io::Resul
         header,
         id,
         browser,
-        destination: destination.ok_or_else(|| {
-            invalid("OpenWire versions 1-3 do not encode a ConsumerInfo destination")
-        })?,
+        destination: destination.ok_or_else(|| invalid("ConsumerInfo destination missing"))?,
         prefetch,
         selector,
         subscription_name,
         no_local,
         exclusive,
+        retroactive,
         priority,
         network,
         broker_path,
@@ -517,12 +509,12 @@ pub fn decode_producer_version(frame: &OpenWireFrame, version: i32) -> io::Resul
 
 pub fn decode_destination_info(
     frame: &OpenWireFrame,
-    version: i32,
+    _version: i32,
 ) -> io::Result<(CommandHeader, Option<WireDestination>, u8)> {
     let mut d = Decoder::new(&frame.payload);
     let header = d.header()?;
     d.id(120)?;
-    let destination = if version >= 4 { d.destination()? } else { None };
+    let destination = d.destination()?;
     let operation = d.u8()?;
     d.i64()?;
     d.skip_object_array(1024)?;
@@ -638,7 +630,8 @@ fn decode_advisory(
                 .id(122)?
                 .ok_or_else(|| invalid("advisory ConsumerInfo ID missing"))?;
             d.bool()?;
-            let destination = if version >= 4 { d.destination()? } else { None }
+            let destination = d
+                .destination()?
                 .ok_or_else(|| invalid("advisory ConsumerInfo destination missing"))?;
             let prefetch = d.i32()?.max(0) as u32;
             d.i32()?;
@@ -651,9 +644,7 @@ fn decode_advisory(
             d.bool()?;
             d.i8()?;
             let broker_path = decode_broker_path(&mut d)?;
-            if version >= 4 {
-                d.skip_nested()?;
-            }
+            d.skip_nested()?;
             let network = d.bool()?;
             d.bool()?;
             d.bool()?;
@@ -859,7 +850,7 @@ fn decode_message_id(d: &mut Decoder<'_>, version: i32) -> io::Result<Option<Str
     obj.i64()?;
     Ok(Some(text.unwrap_or_else(|| {
         producer
-            .map(|p| format!("ID:{}:{}:{}", p.connection, p.session, sequence))
+            .map(|p| format_message_id(&p, sequence))
             .unwrap_or_default()
     })))
 }
@@ -983,16 +974,21 @@ pub fn exception(header: &CommandHeader, class: &str, message: &str) -> OpenWire
     }
 }
 
-pub fn encode_broker_info(id: &str, name: &str) -> OpenWireFrame {
+pub fn encode_broker_info(id: &str, name: &str, version: i32) -> OpenWireFrame {
     let mut p = base(0, false);
     nested_string(&mut p, 124, Some(id));
     let _ = write_string(&mut p, Some(""));
     p.push(0);
     let _ = write_string(&mut p, Some(name));
-    p.extend_from_slice(&[0; 5]);
-    p.extend_from_slice(&0i64.to_be_bytes());
-    let _ = write_string(&mut p, None);
-    let _ = write_string(&mut p, None);
+    p.extend_from_slice(&[0; 3]);
+    if version >= 2 {
+        p.extend_from_slice(&[0; 2]);
+        p.extend_from_slice(&0i64.to_be_bytes());
+    }
+    if version >= 3 {
+        let _ = write_string(&mut p, None);
+        let _ = write_string(&mut p, None);
+    }
     OpenWireFrame {
         command_type: 2,
         payload: p,
@@ -1071,7 +1067,7 @@ pub fn validate_wire_format(frame: &OpenWireFrame) -> io::Result<(i32, Option<u6
         return Err(invalid("invalid OpenWire magic"));
     }
     let version = d.i32()?;
-    if !(4..=12).contains(&version) {
+    if !(1..=12).contains(&version) {
         return Err(invalid("unsupported OpenWire version"));
     }
     let properties = d.bytes(frame.payload.len())?;
@@ -1232,25 +1228,18 @@ pub fn encode_dispatch_version(
     consumer: &WireId,
     destination: &WireDestination,
     message: &crate::core::Message,
-    command_id: i64,
+    _command_id: i64,
     redelivery: u32,
     version: i32,
 ) -> OpenWireFrame {
+    let (producer, sequence) = dispatch_identity(&message.message_id);
     let mut p = base(0, false);
     nested_id(&mut p, 122, consumer);
     nested_destination(&mut p, destination);
     p.push(1);
     p.push(message_type_code(&message.body));
     p.extend_from_slice(&base(0, false));
-    nested_id(
-        &mut p,
-        123,
-        &WireId {
-            connection: "rust".into(),
-            session: 1,
-            value: 0,
-        },
-    );
+    nested_id(&mut p, 123, &producer);
     nested_destination(&mut p, destination);
     p.push(0);
     p.push(0);
@@ -1259,16 +1248,8 @@ pub fn encode_dispatch_version(
     if version >= 10 {
         let _ = write_string(&mut p, Some(&message.message_id));
     }
-    nested_id(
-        &mut p,
-        123,
-        &WireId {
-            connection: "rust".into(),
-            session: 1,
-            value: 0,
-        },
-    );
-    p.extend_from_slice(&command_id.to_be_bytes());
+    nested_id(&mut p, 123, &producer);
+    p.extend_from_slice(&sequence.to_be_bytes());
     p.extend_from_slice(&0i64.to_be_bytes());
     p.push(0);
     let _ = write_string(&mut p, message.group_id.as_deref());
@@ -1322,6 +1303,40 @@ pub fn encode_dispatch_version(
         command_type: 21,
         payload: p,
     }
+}
+
+fn format_message_id(producer: &WireId, sequence: i64) -> String {
+    format!(
+        "{}:{}:{}:{sequence}",
+        producer.connection, producer.session, producer.value
+    )
+}
+
+fn dispatch_identity(message_id: &str) -> (WireId, i64) {
+    if let Some((producer, sequence)) = message_id.rsplit_once(':')
+        && let Some(producer) = parse_wire_id(producer)
+        && let Ok(sequence) = sequence.parse()
+    {
+        return (producer, sequence);
+    }
+    // Legacy MessageId has no textView. Preserve opaque native IDs in the
+    // producer namespace so redelivery/reconnect keeps a stable wire identity.
+    (
+        WireId {
+            connection: message_id.to_owned(),
+            session: 1,
+            value: 0,
+        },
+        0,
+    )
+}
+
+pub fn dispatched_message_id(message_id: &str, version: i32) -> String {
+    if version >= 10 {
+        return message_id.to_owned();
+    }
+    let (producer, sequence) = dispatch_identity(message_id);
+    format_message_id(&producer, sequence)
 }
 
 fn encode_advisory(out: &mut Vec<u8>, advisory: &crate::core::AdvisoryData, version: i32) {
@@ -1392,7 +1407,9 @@ fn encode_advisory(out: &mut Vec<u8>, advisory: &crate::core::AdvisoryData, vers
             out.push(u8::from(*network));
             out.push(0);
             out.push(0);
-            out.push(0);
+            if version >= 4 {
+                out.push(0);
+            }
         }
         AdvisoryData::ConsumerRemoved {
             consumer,
@@ -2217,6 +2234,249 @@ mod tests {
     #[test]
     fn rejects_bad_frame_size() {
         assert!(OpenWireFrame::read_from(&mut Cursor::new(0u32.to_be_bytes()), 10).is_err());
+    }
+
+    #[test]
+    fn consumer_advisory_layouts_include_destination_and_predicate_in_every_version() {
+        use crate::core::{AdvisoryData, Destination};
+        let destination = Destination::queue("orders");
+        let advisory = AdvisoryData::ConsumerAdded {
+            connection: 1,
+            consumer: 3,
+            external_id: Some("ID:client:2:3".into()),
+            destination: destination.clone(),
+            selector: Some("price > 1".into()),
+            durable_name: None,
+            client_id: Some("client".into()),
+            network: true,
+            broker_path: vec!["origin".into()],
+            prefetch: 25,
+        };
+        for version in 1..=12 {
+            let mut payload = Vec::new();
+            encode_advisory(&mut payload, &advisory, version);
+            assert_eq!(payload[..2], [1, 5]);
+            let decoded = decode_consumer_version(
+                &OpenWireFrame {
+                    command_type: 5,
+                    payload: payload[2..].to_vec(),
+                },
+                version,
+            )
+            .unwrap();
+            assert_eq!(decoded.destination, wire_destination(&destination));
+            assert_eq!(decoded.prefetch, 25);
+            assert_eq!(decoded.selector.as_deref(), Some("price > 1"));
+            assert!(!decoded.retroactive);
+            assert!(decoded.network);
+            assert_eq!(decoded.broker_path, ["origin"]);
+            payload.push(0xa5);
+            let mut decoder = Decoder::new(&payload);
+            decoder.nested_version(version).unwrap();
+            assert_eq!(decoder.u8().unwrap(), 0xa5, "version {version}");
+        }
+    }
+
+    #[test]
+    fn destination_info_layout_is_unchanged_in_legacy_versions() {
+        let connection = WireId {
+            connection: "ID:client".into(),
+            session: 0,
+            value: 0,
+        };
+        let destination = WireDestination {
+            kind: 100,
+            name: "orders".into(),
+        };
+        for version in 1..=12 {
+            let frame = client_destination_info(7, &connection, &destination, 1);
+            let (_, decoded, operation) = decode_destination_info(&frame, version).unwrap();
+            assert_eq!(decoded, Some(destination.clone()));
+            assert_eq!(operation, 1);
+        }
+    }
+
+    #[test]
+    fn dispatch_preserves_message_identity_across_versions_and_redelivery() {
+        use crate::core::{Destination, Message};
+        let consumer = WireId {
+            connection: "ID:consumer".into(),
+            session: 2,
+            value: 3,
+        };
+        let destination = wire_destination(&Destination::queue("orders"));
+        for id in ["ID:producer:7:8:9", "ID:native-uuid"] {
+            let mut message = Message::text(Destination::queue("orders"), "body");
+            message.message_id = id.to_owned();
+            for version in 1..=12 {
+                for (command_id, redelivery) in [(1, 0), (999, 1)] {
+                    let frame = encode_dispatch_version(
+                        &consumer,
+                        &destination,
+                        &message,
+                        command_id,
+                        redelivery,
+                        version,
+                    );
+                    let (_, _, incoming, actual_redelivery) =
+                        decode_dispatch_version(&frame, 1024 * 1024, version).unwrap();
+                    assert_eq!(incoming.message_id, dispatched_message_id(id, version));
+                    assert_eq!(actual_redelivery, redelivery);
+                    if id == "ID:producer:7:8:9" {
+                        assert_eq!(incoming.message_id, id);
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_acknowledgements_consume_opaque_native_message_ids() {
+        use super::super::{FrameReader, write_frame};
+        use crate::config::{AppConfig, ListenerConfig};
+        use crate::core::{AdvisoryData, ConnectInfo, Destination, Message};
+        use tokio::net::TcpStream;
+
+        fn command(advisory: &AdvisoryData, version: i32, id: i32) -> OpenWireFrame {
+            let mut encoded = Vec::new();
+            encode_advisory(&mut encoded, advisory, version);
+            let mut payload = encoded[2..].to_vec();
+            payload[..5].copy_from_slice(&base(id, true));
+            OpenWireFrame {
+                command_type: encoded[1],
+                payload,
+            }
+        }
+
+        async fn receive(stream: &mut TcpStream, reader: &mut FrameReader) -> OpenWireFrame {
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                loop {
+                    let frame = reader.read_frame(stream, 1024 * 1024).await.unwrap();
+                    if frame.command_type != 10 {
+                        return frame;
+                    }
+                }
+            })
+            .await
+            .unwrap()
+        }
+
+        async fn exchange(
+            stream: &mut TcpStream,
+            reader: &mut FrameReader,
+            frame: &OpenWireFrame,
+        ) -> OpenWireFrame {
+            write_frame(stream, frame, 1024 * 1024).await.unwrap();
+            receive(stream, reader).await
+        }
+
+        for version in [1, 9, 12] {
+            let mut config = AppConfig::default();
+            config.protocols.openwire = ListenerConfig::new(true, "127.0.0.1:0");
+            config.protocols.stomp.enabled = false;
+            config.protocols.amqp.enabled = false;
+            config.protocols.mqtt.enabled = false;
+            config.persistence.backend = "memory".into();
+            config.web_console.enabled = false;
+            config.policy.advisory_support = false;
+            let broker = crate::runtime::start(config).await.unwrap();
+            let mut stream = TcpStream::connect(broker.address("openwire").unwrap())
+                .await
+                .unwrap();
+            let mut reader = FrameReader::default();
+            assert_eq!(
+                exchange(
+                    &mut stream,
+                    &mut reader,
+                    &encode_wire_format_info("test", 1024 * 1024, version),
+                )
+                .await
+                .command_type,
+                1
+            );
+            assert_eq!(
+                reader
+                    .read_frame(&mut stream, 1024 * 1024)
+                    .await
+                    .unwrap()
+                    .command_type,
+                2
+            );
+            let connection = command(
+                &AdvisoryData::ConnectionAdded {
+                    connection: 17,
+                    client_id: Some("native-id-consumer".into()),
+                    username: None,
+                    remote_address: "test".into(),
+                },
+                version,
+                1,
+            );
+            assert_eq!(
+                exchange(&mut stream, &mut reader, &connection)
+                    .await
+                    .command_type,
+                30
+            );
+            let destination = Destination::queue("native-message-ids");
+            let consumer = command(
+                &AdvisoryData::ConsumerAdded {
+                    connection: 17,
+                    consumer: 1,
+                    external_id: Some("rust-17:1:1".into()),
+                    destination: destination.clone(),
+                    selector: None,
+                    durable_name: None,
+                    client_id: None,
+                    network: false,
+                    broker_path: Vec::new(),
+                    prefetch: 10,
+                },
+                version,
+                2,
+            );
+            assert_eq!(
+                exchange(&mut stream, &mut reader, &consumer)
+                    .await
+                    .command_type,
+                30
+            );
+            let (publisher, _) = broker.core.connect(ConnectInfo::default()).unwrap();
+            for ack_type in [2, 4] {
+                let message = Message::text(destination.clone(), "native message");
+                let (producer, sequence) = dispatch_identity(&message.message_id);
+                broker.core.send(publisher, message, None).unwrap();
+                let frame = receive(&mut stream, &mut reader).await;
+                let (consumer, wire_destination, incoming, _) =
+                    decode_dispatch_version(&frame, 1024 * 1024, version).unwrap();
+                assert_eq!(broker.core.consumers()[0].in_flight, 1);
+                let mut payload = base(3, true);
+                nested_destination(&mut payload, &wire_destination);
+                payload.push(0);
+                nested_id(&mut payload, 122, &consumer);
+                payload.extend_from_slice(&[ack_type, 0, 1, 110]);
+                if version >= 10 {
+                    write_string(&mut payload, Some(&incoming.message_id)).unwrap();
+                }
+                nested_id(&mut payload, 123, &producer);
+                payload.extend_from_slice(&sequence.to_be_bytes());
+                payload.extend_from_slice(&0i64.to_be_bytes());
+                payload.extend_from_slice(&1i32.to_be_bytes());
+                if version >= 7 {
+                    payload.push(0);
+                }
+                let ack = OpenWireFrame {
+                    command_type: 22,
+                    payload,
+                };
+                assert_eq!(
+                    exchange(&mut stream, &mut reader, &ack).await.command_type,
+                    30
+                );
+                assert_eq!(broker.core.consumers()[0].in_flight, 0);
+            }
+            broker.stop();
+        }
     }
 
     #[test]

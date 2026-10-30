@@ -13,12 +13,12 @@ public final class InteropCheck {
             "OPENWIRE_INTEROP_URL", "tcp://127.0.0.1:61616");
 
     public static void main(String[] args) throws Exception {
-        int first = args.length == 0 ? 4 : Integer.parseInt(args[0]);
+        int first = args.length == 0 ? 1 : Integer.parseInt(args[0]);
         int last = args.length < 2 ? (args.length == 0 ? 12 : first) : Integer.parseInt(args[1]);
         for (int version = first; version <= last; version++) {
             runVersion(version);
             System.out.println("OpenWire v" + version
-                    + ": queue, selector, topic, transaction, producer window OK");
+                    + ": queue, selector, topic, transaction, identity, acknowledgement, producer window OK");
         }
     }
 
@@ -52,17 +52,26 @@ public final class InteropCheck {
             require(received instanceof TextMessage, "selected queue message missing");
             require(("queue-v" + version).equals(((TextMessage) received).getText()),
                     "queue transaction or selector mismatch");
+            require(queued.getJMSMessageID().equals(received.getJMSMessageID()),
+                    "queue message identity changed");
+            session.commit();
+            selected.close();
+            selected = session.createConsumer(queue, "marker = 'match'");
+            require(selected.receive(150) == null, "committed acknowledgement was not consumed");
             session.commit();
 
             Topic topic = session.createTopic("openwire.interop.topic.v" + version);
             MessageConsumer subscriber = session.createConsumer(topic);
             MessageProducer publisher = session.createProducer(topic);
-            publisher.send(session.createTextMessage("topic-v" + version));
+            TextMessage published = session.createTextMessage("topic-v" + version);
+            publisher.send(published);
             session.commit();
             Message topicMessage = subscriber.receive(4000);
             require(topicMessage instanceof TextMessage, "topic dispatch missing");
             require(("topic-v" + version).equals(((TextMessage) topicMessage).getText()),
                     "topic payload mismatch");
+            require(published.getJMSMessageID().equals(topicMessage.getJMSMessageID()),
+                    "topic message identity changed");
             session.commit();
             session.close();
         }

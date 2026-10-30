@@ -222,6 +222,37 @@ impl From<super::security::SecurityError> for CoreError {
     }
 }
 
+/// Volatile topic history used by retroactive consumers.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SubscriptionRecoveryPolicy {
+    #[default]
+    None,
+    LastImage,
+    FixedCount {
+        maximum_size: usize,
+    },
+}
+
+impl SubscriptionRecoveryPolicy {
+    pub(crate) fn validate(&self) -> Result<(), CoreError> {
+        if matches!(self, Self::FixedCount { maximum_size: 0 }) {
+            return Err(CoreError::IllegalState(
+                "fixed_count subscription recovery maximum_size must be positive".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        match self {
+            Self::None => 0,
+            Self::LastImage => 1,
+            Self::FixedCount { maximum_size } => *maximum_size,
+        }
+    }
+}
+
 /// Broker wide behaviour, mirroring ActiveMQ Classic policy entries.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -244,6 +275,10 @@ pub struct Policy {
     /// Whether producers may create destinations implicitly.
     pub auto_create_destinations: bool,
     pub expire_check_interval_ms: u64,
+    /// Volatile per-topic recovery history, separate from MQTT retained state.
+    pub subscription_recovery: SubscriptionRecoveryPolicy,
+    /// Replay configured recovery history even without a retroactive consumer flag.
+    pub always_retroactive: bool,
 }
 
 impl Default for Policy {
@@ -262,6 +297,8 @@ impl Default for Policy {
             virtual_topic_consumer_prefix: "Consumer.".to_owned(),
             auto_create_destinations: true,
             expire_check_interval_ms: 1000,
+            subscription_recovery: SubscriptionRecoveryPolicy::None,
+            always_retroactive: false,
         }
     }
 }

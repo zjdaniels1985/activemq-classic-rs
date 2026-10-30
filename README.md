@@ -11,6 +11,7 @@ is evolving; do not expose this development broker to untrusted networks.
 
 - Queues and topics, wildcard/composite destinations, durable subscriptions,
   temporary destinations, virtual topics, noLocal and queue browsers.
+- Retroactive topic consumers with bounded last-image or fixed-count recovery.
 - SQL-92 selectors, message priority, exclusive consumers, message groups,
   expiration, redelivery and dead-letter queues.
 - Local transactions and recoverable prepared XA transactions.
@@ -47,7 +48,7 @@ limited. **Unsupported** means this repository does not implement the feature.
 |---|---|---|---|
 | Broker runtime / native API | Rust / `BrokerCore`; no Rust translation of JMS | Java / JMS clients | Java / Core and JMS clients |
 | Existing Java JMS clients | Partial: ActiveMQ 6.2.6 client interoperability exercised; not certified JMS parity | Native ActiveMQ clients | OpenWire compatibility and Artemis JMS clients |
-| OpenWire | Partial: v4–v12 loose encoding; v1–v3 rejected; not every command supported | Native protocol | Compatibility protocol for Classic 5.12+ clients |
+| OpenWire | Partial: v1–v12 loose encoding; not every command supported | Native protocol | Compatibility protocol for Classic 5.12+ clients |
 | STOMP | 1.0–1.2 TCP; typed map-JSON input; no XML/object transformation | STOMP with Classic extensions and transformations | 1.0–1.2 |
 | AMQP | Partial: AMQP 1.0 TCP; Proton transactions and durable reconnect exercised | AMQP 1.0 | AMQP 1.0 |
 | MQTT | 3.1/3.1.1; retained replay on repeated SUBSCRIBE; no MQTT 5 | 3.1/3.1.1 | 3.1/3.1.1 and 5 |
@@ -56,6 +57,7 @@ limited. **Unsupported** means this repository does not implement the feature.
 | Transactions | Local and recoverable prepared XA; protocol-specific interoperability coverage | Local and XA | Local and XA |
 | Delayed/scheduled delivery | Classic delay/period/repeat/cron properties and scheduler management | Optional persistent scheduler, including cron/repeat | Scheduled delivery using `_AMQ_SCHED_DELIVERY`; different scheduling model |
 | Expiry, DLQ, groups and exclusive consumers | Implemented in core | Supported | Supported |
+| Retroactive topic recovery | Last-image/fixed-count volatile history; retroactive and always-retroactive consumers | Configurable subscription recovery policies | Last-value and retroactive-address mechanisms; different configuration |
 | Persistence | Sled or memory; no KahaDB file compatibility | KahaDB default; JDBC option | File journal default; JDBC option |
 | Authentication / authorization | Basic users, passwords/digests and destination/group rules; no JAAS/plugin parity | Simple authentication, JAAS and authorization plugins | JAAS/custom security managers and role permissions |
 | Administration / logging | Rust web console, JSON API, structured text/JSON/file logging; no JMX | Web console, JMX/Jolokia and Java logging | Web console, JMX/Jolokia, management API and Java logging |
@@ -228,12 +230,64 @@ approximately 33.1 ms versus 1.2 ms. The current runs used 771–842 flushes for
 are not production capacity estimates. Single-producer workloads can pay worker
 handoff overhead without batching gains; benchmark your own workloads and disk.
 
+## Classic 6.2.6 parity target
+
+The reference release is **Apache ActiveMQ Classic 6.2.6**. The goal is
+client-visible behavioral parity across protocols, messaging, security,
+administration, networking and recovery, while retaining Rust and Sled.
+Loading Java plugin binaries and directly reading KahaDB files are outside
+that target; existing Java applications should continue using compatible
+wire protocols rather than a Rust translation of JMS.
+
+The differential harness runs identical Java assertions against an embedded,
+unmodified Classic broker and this broker. A passing scenario establishes
+that scenario only, not certification or parity for the entire feature.
+
+| Area | Verified progress | Remaining release gates |
+|---|---|---|
+| OpenWire versions | Real Classic client queue/topic/selector/transaction/identity/acknowledgement checks for v1–v12 | Full command/advisory matrix, transport options and malformed/failure cases |
+| Lifecycle | Session child producer/consumer removal; queue destroy/recreate and active-consumer rejection | Connection/session transaction ownership, destination-removal timeouts and inactive-durable combinations |
+| Topic recovery | None/last-image/fixed-count; retroactive/always-retroactive; selector, wildcard, noLocal, expiry, transactions and durable backlog | Fixed-size/timed/query policies, retained-policy combinations and memory-pressure behavior |
+| Messaging/storage | Core local/XA, scheduling, durable subscriptions, Sled restart/crash checks | Exhaustive policy combinations, transactional failure/recovery and bounded resource behavior against Classic |
+| Other protocols | STOMP, MQTT and AMQP client harnesses | Differential extension, error, reconnect and crash matrices |
+| Security/administration | Basic authentication/authorization, web console and JSON API | Equivalent external security integrations and management operations/observability; no JMX compatibility yet |
+| Transports/networking | TCP, selected duplex/demand/temporary queue/reconnect scenarios | TLS/WebSocket, temporary topics, discovery, HA and exhaustive persistent-peer/failover behavior |
+
+These are unfinished release gates, not a declaration that all unlisted
+Classic features are supported.
+
+### Topic subscription recovery
+
+History is disabled by default. To retain the last 100 publications per topic:
+
+```toml
+[policy]
+always_retroactive = false
+
+[policy.subscription_recovery]
+type = "fixed_count"
+maximum_size = 100
+```
+
+Use `type = "last_image"` without `maximum_size` to retain one publication.
+OpenWire consumers opt in with `consumer.retroactive=true` on their topic URI;
+`always_retroactive = true` enables recovery without that option.
+Selectors, noLocal and expiration still apply. Existing durable backlog takes
+precedence over history so an offline publication is not replayed twice.
+History is volatile, bounded by count per topic (not a broker-wide byte cap),
+and discarded on destination deletion or broker restart. This is separate
+from MQTT retained storage; retained/recovery-policy combinations still need
+broader Classic differential coverage.
+
 ## Known compatibility limits
 
-- OpenWire negotiates v4–v12 with tight encoding and caches disabled. The
+- OpenWire negotiates v1–v12 with tight encoding and caches disabled. The
   ActiveMQ 6.2.6 Java client passes queue, selector, topic and transaction
   commit/rollback checks at each supported version, including a small producer
-  window. Versions 1–3 are explicitly rejected. Lifecycle advisories preserve
+  window where the version supports it (v3+). Message IDs preserve the full
+  producer identity and sequence; legacy acknowledgements are correlated with
+  core deliveries even when the original ID came from another protocol.
+  Lifecycle advisories preserve
   connection, producer, consumer, destination and removal payloads, but not
   every Classic command/advisory or transport option is implemented.
 - STOMP `transformation:jms-map-json` SEND frames without `content-length`
@@ -260,7 +314,7 @@ handoff overhead without batching gains; benchmark your own workloads and disk.
   response can cause duplicates on retry. An idle duplex consumer is recycled
   after 24 hours; this is not full Classic bridge/failover behavior.
 - TLS/WebSocket transports, discovery/multicast, JMX, XPath selectors,
-  retroactive consumers and MQTT 5 are unsupported.
+  fixed-size/timed/query subscription recovery and MQTT 5 are unsupported.
 - Complete Classic plugin, management, storage, clustering and failure-mode
   parity has not been established.
 
@@ -276,12 +330,20 @@ Third-party client checks live under `tests/interop/`. Follow each harness's
 dependency/setup instructions. Core unit tests and protocol TCP tests run with
 `cargo test`.
 
-`tests/interop/openwire/run.sh` checks all supported versions (4–12) using an
+`tests/interop/openwire/run.sh` checks all supported versions (1–12) using an
 unmodified ActiveMQ 6.2.6 Java client. Pass a version or inclusive version range
 to narrow the run. `tests/interop/network/ClassicPeer.java` provides a stock
 Classic peer and bidirectional queue/topic/temporary-reply checks; configure
 duplex demand includes for `queue://interop.>`, `topic://interop.>` and
 `temp-queue://>` when running that harness.
+
+`tests/interop/openwire/parity.sh` runs the same recovery/lifecycle assertions
+against stock Classic 6.2.6 and Rust, for three recovery policies, both
+`always_retroactive` settings and OpenWire versions 1, 3 and 12. Override the
+matrix with `OPENWIRE_PARITY_VERSIONS="1 2 3 4 5 6 7 8 9 10 11 12"` for all
+versions. It builds the Rust broker, resolves the Java reference dependencies
+with Maven, starts isolated brokers and preserves diagnostic logs under
+`target/tmp/classic-parity.*`.
 
 To check STOMP map JSON against an unmodified Java JMS client, set
 `AMQ_CLASSPATH` to the ActiveMQ 6.2.6 client and its runtime dependency jars,

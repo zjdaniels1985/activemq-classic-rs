@@ -369,6 +369,18 @@ impl BrokerCore {
         self.flush_batch(inner)
     }
 
+    /// Removes a destination on behalf of an authorized protocol client.
+    pub fn remove_destination(
+        &self,
+        connection: ConnectionId,
+        destination: &Destination,
+    ) -> Result<(), CoreError> {
+        if destination.is_temporary() {
+            return self.delete_temp(connection, destination);
+        }
+        self.delete_destination_for(Some(connection), destination)
+    }
+
     /// Sends a message, optionally inside a transaction.
     pub fn send(
         &self,
@@ -491,6 +503,13 @@ impl BrokerCore {
         let destination = &message.destination;
         if let Some(stats) = inner.topics.get_mut(&destination.name) {
             stats.enqueued += 1;
+            let capacity = self.policy.subscription_recovery.capacity();
+            if capacity > 0 {
+                stats.recovery.push_back(Arc::clone(&message));
+                while stats.recovery.len() > capacity {
+                    stats.recovery.pop_front();
+                }
+            }
         }
         if self.policy.virtual_topics
             && destination.kind == DestinationKind::Topic

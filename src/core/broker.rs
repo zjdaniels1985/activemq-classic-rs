@@ -1,7 +1,7 @@
 //! The protocol-neutral broker: state, recovery and shared helpers.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -95,6 +95,7 @@ pub(crate) struct Transaction {
 #[derive(Default)]
 pub(crate) struct TopicStats {
     pub enqueued: u64,
+    pub recovery: VecDeque<Arc<Message>>,
 }
 
 pub(crate) struct Inner {
@@ -277,6 +278,7 @@ impl BrokerCore {
         options: StoreOptions,
     ) -> Result<Arc<Self>, CoreError> {
         options.validate()?;
+        policy.subscription_recovery.validate()?;
         let store = data_dir
             .map(|path| Store::open_with_options(path, options))
             .transpose()?;

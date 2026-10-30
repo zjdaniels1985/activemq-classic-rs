@@ -259,6 +259,14 @@ impl BrokerCore {
             if created {
                 self.deliver_retained(&mut inner, &key, &destination);
             }
+            if (options.retroactive || self.policy.always_retroactive)
+                && inner
+                    .queues
+                    .get(&key)
+                    .is_some_and(|queue| queue.pending.is_empty() && queue.in_flight == 0)
+            {
+                self.recover_topic_history(&mut inner, &key)?;
+            }
             consumer.durable = Some(durable);
             keys.push(key);
         } else {
@@ -281,6 +289,9 @@ impl BrokerCore {
             }
             self.replay_advisories(&mut inner, &key, &destination);
             self.deliver_retained(&mut inner, &key, &destination);
+            if options.retroactive || self.policy.always_retroactive {
+                self.recover_topic_history(&mut inner, &key)?;
+            }
             keys.push(key);
         }
 
@@ -307,6 +318,28 @@ impl BrokerCore {
         }
         self.flush_batch(inner)?;
         Ok(id)
+    }
+
+    fn recover_topic_history(&self, inner: &mut Inner, key: &str) -> Result<(), CoreError> {
+        let Some(filter) = inner
+            .queues
+            .get(key)
+            .and_then(|queue| queue.filter.as_ref())
+        else {
+            return Ok(());
+        };
+        let now = now_millis();
+        let messages = inner
+            .topics
+            .values()
+            .flat_map(|topic| &topic.recovery)
+            .filter(|message| !message.is_expired(now) && filter.accepts(message))
+            .cloned()
+            .collect::<Vec<_>>();
+        for message in messages {
+            self.enqueue(inner, key, message)?;
+        }
+        Ok(())
     }
 
     /// Replays the current state to a new advisory subscriber, like ActiveMQ

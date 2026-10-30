@@ -273,7 +273,29 @@ impl BrokerCore {
 
     /// Deletes a queue or topic, closing its consumers.
     pub fn delete_destination(&self, destination: &Destination) -> Result<(), CoreError> {
+        self.delete_destination_for(None, destination)
+    }
+
+    pub(crate) fn delete_destination_for(
+        &self,
+        connection: Option<ConnectionId>,
+        destination: &Destination,
+    ) -> Result<(), CoreError> {
         let mut inner = self.write_lock()?;
+        if let Some(connection) = connection {
+            let principal = inner.principal(connection)?;
+            self.security
+                .authorize(&principal, destination, super::security::Permission::Admin)?;
+            if inner
+                .consumers
+                .values()
+                .any(|consumer| consumer.options.destination.matches(destination))
+            {
+                return Err(CoreError::IllegalState(format!(
+                    "Destination {destination} still has active subscriptions"
+                )));
+            }
+        }
         if !inner.destination_exists(destination) {
             return Err(CoreError::NotFound(format!("{destination} does not exist")));
         }
